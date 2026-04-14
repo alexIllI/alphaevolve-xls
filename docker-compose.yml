@@ -1,0 +1,52 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AlphaEvolve-XLS  docker-compose.yml
+#
+# Usage:
+#   First time (builds XLS from source — slow, ~2-6 hours):
+#     docker-compose run --rm evolve python run.py --help
+#
+#   Subsequent runs (incremental build, ~2-3 min per iteration):
+#     docker-compose run --rm evolve python run.py \
+#       --input_file designs/mac/mac.x --iterations 20
+#
+#   Interactive shell:
+#     docker-compose run --rm evolve bash
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  evolve:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BAZEL_JOBS: ${BAZEL_JOBS:-8}
+    image: alphaevolve-xls:latest
+    container_name: alphaevolve_runner
+    environment:
+      # AI backend
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-o3}
+      # Paths inside container (fixed — volumes map them here)
+      - XLS_SRC_PATH=/workspace/xls
+      - XLS_BIN_PATH=/workspace/xls/bazel-bin/xls/tools
+      - CODEGEN_BAZEL_TARGET=//xls/tools:codegen_main
+      - BAZEL_JOBS=${BAZEL_JOBS:-8}
+    volumes:
+      # XLS source (mutated during experiments)
+      - ${XLS_SRC_PATH:-/mnt/d/final/xls}:/workspace/xls
+      # This project (live-mounted for development)
+      - .:/workspace/alphaevolve-xls
+      # Persistent Bazel cache — THE KEY to fast incremental builds
+      # This volume survives container restarts, so the 2-6hr build happens ONCE
+      - bazel-cache:/root/.cache/bazel
+    working_dir: /workspace/alphaevolve-xls
+    # Increase if running many parallel evaluations
+    shm_size: "2gb"
+
+volumes:
+  # Named volume for Bazel build cache.
+  # DO NOT delete this volume unless you want to rebuild XLS from scratch.
+  bazel-cache:
+    name: alphaevolve_bazel_cache

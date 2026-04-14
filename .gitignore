@@ -1,0 +1,35 @@
+# Results and generated artifacts
+results/
+!results/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Environment
+.env
+
+# XLS generated files (produced during experiments)
+*.ir
+*.v
+*.patch.bak
+*.textproto
+candidates_db.sqlite
+candidates_db.sqlite-shm
+candidates_db.sqlite-wal
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/

@@ -1,0 +1,27 @@
+{# Jinja2 template — rendered by sampler.py before each Codex CLI call #}
+== CURRENT TASK ==
+Implement a new version of the function `{{ mutation_target }}` in XLS's SDC scheduler.
+
+== CURRENT PPA SCORE ==
+Best score so far: {{ best_score }} (lower is better)
+  ↳ {{ best_num_stages }} pipeline stages, {{ best_reg_bits }} register bits, {{ best_delay_ps }}ps critical path
+
+Parent candidate score: {{ parent_score }}
+  ↳ {{ parent_num_stages }} stages, {{ parent_reg_bits }} register bits, {{ parent_delay_ps }}ps
+
+== MUTATION INSTRUCTION ==
+{{ mutation_instruction }}
+
+== RELEVANT ALGORITHMS FROM LITERATURE ==
+{{ knowledge_context }}
+
+== CURRENT FUNCTION SOURCE (what you are replacing) ==
+{{ current_function_source }}
+
+== XLS SCHEDULING SOURCE CONTEXT ==
+The following is the full current sdc_scheduler.cc for reference:
+{{ sdc_scheduler_source }}
+
+== YOUR OUTPUT ==
+Write the complete C++ implementation of `{{ mutation_target }}`. Include any private
+helper functions needed. Preserve the exact function signature. Output C++ only.

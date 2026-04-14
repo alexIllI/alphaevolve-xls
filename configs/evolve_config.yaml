@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# evolve_config.yaml
+# AlphaEvolve hyperparameters and experiment settings.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Population ────────────────────────────────────────────────────────────────
+num_islands: 4          # Number of independent island populations
+migration_interval: 5   # Every N iterations, share global best across islands
+
+# ── AI Sampler ────────────────────────────────────────────────────────────────
+ai_backend: "openai"    # 'openai' (Python SDK) or 'codex' (Codex CLI subprocess)
+ai_model: "o3"          # OpenAI model: o3, o4-mini, gpt-4o, etc.
+max_tokens: 8192        # Max tokens for AI response
+
+# ── Mutation targets (which functions the AI evolves) ─────────────────────────
+# Available: 'sdc_objective', 'delay_constraints', 'min_cut'
+mutation_types:
+  - sdc_objective
+  - delay_constraints
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+bazel_jobs: 8           # Parallel Bazel jobs (set to your core count)
+
+# ── PPA Scoring ───────────────────────────────────────────────────────────────
+# Score = num_stages * stage_weight + pipeline_reg_bits * reg_weight
+# Lower is better.
+stage_weight: 1000      # Stages are the primary optimization target
+reg_weight: 1           # Register bits secondary
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log_level: "INFO"       # DEBUG | INFO | WARNING
+save_all_verilog: false # If true, keep generated .v for every candidate
