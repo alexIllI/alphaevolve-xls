@@ -63,13 +63,21 @@ fi
 
 # ── 5. Python virtual environment ─────────────────────────────────────────────
 cd "$PROJECT_DIR"
-if [ ! -d ".venv" ]; then
+
+# Ensure python3-venv is installed (needed for ensurepip/pip inside the venv)
+if ! python3 -c "import ensurepip" &>/dev/null; then
+  echo "[INFO] Installing python3-venv..."
+  sudo apt-get install -y python3-venv python3.10-venv
+fi
+
+if [ ! -f ".venv/bin/pip" ]; then
   echo "[INFO] Creating Python virtual environment..."
   python3 -m venv .venv
 fi
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
+
+echo "[INFO] Installing Python dependencies..."
+.venv/bin/pip install --upgrade pip -q
+.venv/bin/pip install -r requirements.txt -q
 echo "[OK] Python venv ready at $PROJECT_DIR/.venv"
 
 # ── 6. Environment file ───────────────────────────────────────────────────────

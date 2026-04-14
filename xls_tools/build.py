@@ -33,10 +33,11 @@ class XLSBuilder:
     """Manages incremental Bazel builds of XLS codegen_main."""
 
     # Targets needed for the full DSLX→Verilog pipeline
+    # NOTE: ir_converter_main lives under dslx/ir_convert, not tools
     TARGETS = [
         "//xls/tools:codegen_main",
         "//xls/tools:opt_main",
-        "//xls/tools:ir_converter_main",
+        "//xls/dslx/ir_convert:ir_converter_main",
     ]
 
     def __init__(

@@ -55,10 +55,21 @@ class XLSPipeline:
 
         self.tmp_dir = Path(tmp_dir) if tmp_dir else None
 
+    # Map tool name → relative path inside bazel-bin (bazel puts binaries where the target lives)
+    _TOOL_PATHS = {
+        "ir_converter_main": "xls/dslx/ir_convert/ir_converter_main",
+        "opt_main":           "xls/tools/opt_main",
+        "codegen_main":       "xls/tools/codegen_main",
+    }
+
     def _bin(self, name: str) -> Path:
         """Resolve a binary, preferring custom Bazel build."""
+        # Try Bazel build output first (may be in a non-tools subdirectory)
         if self.bazel_bin_dir:
-            p = self.bazel_bin_dir / name
+            rel = self._TOOL_PATHS.get(name, f"xls/tools/{name}")
+            # bazel_bin_dir is already xls/bazel-bin/xls/tools — go up to bazel-bin root
+            bazel_root = self.bazel_bin_dir.parent.parent  # .../xls/bazel-bin
+            p = bazel_root / rel
             if p.exists():
                 return p
         if self.prebuilt_bin_dir:
