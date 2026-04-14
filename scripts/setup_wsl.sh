@@ -75,9 +75,9 @@ if [ ! -f ".venv/bin/pip" ]; then
   python3 -m venv .venv
 fi
 
-echo "[INFO] Installing Python dependencies..."
-.venv/bin/pip install --upgrade pip -q
-.venv/bin/pip install -r requirements.txt -q
+echo "[INFO] Installing Python dependencies (this takes 1-3 min)..."
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -r requirements.txt
 echo "[OK] Python venv ready at $PROJECT_DIR/.venv"
 
 # ── 6. Environment file ───────────────────────────────────────────────────────
