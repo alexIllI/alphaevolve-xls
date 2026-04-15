@@ -4,14 +4,14 @@ alphaevolve/sampler.py
 Interfaces with the AI backend to generate C++ scheduling algorithm implementations.
 
 Supports two backends:
-  1. Codex CLI  — `codex` subprocess (interactive, stateful)
-  2. OpenAI SDK — direct API call (faster for batch, good fallback)
+  1. Codex CLI  — `codex` npm package (uses education/ChatGPT subscription auth)
+                  Works WITHOUT a paid API key if `codex auth login` was run.
+  2. OpenAI SDK — direct API call via Python (requires OPENAI_API_KEY with credits)
 
-The sampler:
-  1. Loads the system prompt and the Jinja2 implement.txt template
-  2. Renders the prompt with the current evolution context
-  3. Calls the AI and extracts the C++ code from the response
-  4. Returns the generated code string
+Codex CLI approach (non-interactive):
+  We write the full prompt to a temp file, then instruct codex to read it and
+  write ONLY C++ code to a second temp file. This is the native file-operation
+  workflow that Codex CLI is designed for, making it fully non-interactive.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-import textwrap
+import tempfile
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
@@ -34,7 +34,7 @@ class Sampler:
 
     def __init__(
         self,
-        backend: str = "openai",   # 'openai' | 'codex'
+        backend: str = "codex",   # 'codex' | 'openai'
         model: str = "o3",
         api_key: str | None = None,
         max_tokens: int = 8192,
@@ -99,65 +99,143 @@ class Sampler:
 
         return self._extract_cpp(raw)
 
-    # ── Backend implementations ────────────────────────────────────────────────
+    # ── Codex CLI backend (primary) ────────────────────────────────────────────
+
+    def _call_codex(self, user_prompt: str) -> str:
+        """
+        Call the @openai/codex npm CLI non-interactively using a file-based workflow:
+
+        1. Write the full prompt to /tmp/alphaevolve_prompt_{pid}.txt
+        2. Write expected output path to /tmp/alphaevolve_output_{pid}.cpp
+        3. Ask codex to read the prompt and write C++ to the output file
+        4. Read and return the output file
+
+        This works with:
+          - Education/ChatGPT subscription (codex auth login)
+          - API key via OPENAI_API_KEY env var
+
+        The file approach avoids TTY issues and shell escaping problems with
+        large C++ code prompts.
+        """
+        pid = os.getpid()
+        prompt_file = Path(f"/tmp/alphaevolve_prompt_{pid}.txt")
+        output_file = Path(f"/tmp/alphaevolve_output_{pid}.cpp")
+
+        try:
+            # Write full prompt to file
+            full_prompt = f"{self._system_prompt}\n\n{user_prompt}"
+            prompt_file.write_text(full_prompt, encoding="utf-8")
+
+            # Remove any stale output file
+            if output_file.exists():
+                output_file.unlink()
+
+            # Codex instruction: read prompt, write C++ to output file
+            codex_task = (
+                f"Read the file {prompt_file} carefully. "
+                f"It contains a request to implement a C++ scheduling algorithm function. "
+                f"Write ONLY the complete, valid C++ implementation to {output_file}. "
+                f"No prose, no markdown, no ``` fences — pure C++ source code only."
+            )
+
+            env = {**os.environ}
+            if self.api_key:
+                env["OPENAI_API_KEY"] = self.api_key
+
+            result = subprocess.run(
+                [
+                    "codex",
+                    "--model", self.model,
+                    "--approval-mode", "full-auto",
+                    "--quiet",
+                    codex_task,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env=env,
+            )
+
+            # Prefer the output file (codex wrote C++ there)
+            if output_file.exists() and output_file.stat().st_size > 0:
+                return output_file.read_text(encoding="utf-8")
+
+            # Fallback: parse C++ out of stdout/stderr
+            combined = result.stdout + result.stderr
+            if result.returncode != 0 and not combined.strip():
+                raise RuntimeError(
+                    f"codex exited with code {result.returncode} and no output.\n"
+                    f"stderr: {result.stderr[:500]}\n"
+                    "Hint: try running `codex auth login` in WSL to authenticate."
+                )
+
+            return combined
+
+        except FileNotFoundError:
+            raise RuntimeError(
+                "Codex CLI not found. Install with: npm install -g @openai/codex\n"
+                "Then authenticate: codex auth login"
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Codex CLI timed out after 300s")
+        finally:
+            prompt_file.unlink(missing_ok=True)
+            output_file.unlink(missing_ok=True)
+
+    # ── OpenAI SDK backend (fallback) ──────────────────────────────────────────
 
     def _call_openai(self, user_prompt: str) -> str:
-        """Call OpenAI API directly via Python SDK."""
+        """
+        Call OpenAI API directly via Python SDK.
+        Requires OPENAI_API_KEY with sufficient credits.
+        Falls back through models if the primary is not accessible.
+        """
         try:
-            from openai import OpenAI
+            from openai import OpenAI, AuthenticationError, PermissionDeniedError
         except ImportError:
             raise RuntimeError("openai package not installed. Run: pip install openai")
 
         client = OpenAI(api_key=self.api_key)
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": self._system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
-            max_completion_tokens=self.max_tokens,
+
+        # Try primary model, fall back to more accessible ones
+        model_fallback = [self.model, "o4-mini", "gpt-4o"]
+        last_error = None
+
+        for model in model_fallback:
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": self._system_prompt},
+                        {"role": "user",   "content": user_prompt},
+                    ],
+                    max_completion_tokens=self.max_tokens,
+                )
+                if model != self.model:
+                    print(f"[sampler] Note: fell back to model '{model}' ('{self.model}' not accessible)")
+                return response.choices[0].message.content or ""
+            except (AuthenticationError, PermissionDeniedError) as e:
+                last_error = e
+                continue
+            except Exception as e:
+                # Non-auth error — don't retry with different model
+                raise
+
+        raise RuntimeError(
+            f"All models failed. Last error: {last_error}\n"
+            "Tip: switch to --backend codex and run `codex auth login` in WSL."
         )
-        return response.choices[0].message.content or ""
-
-    def _call_codex(self, user_prompt: str) -> str:
-        """
-        Call Codex CLI via subprocess.
-        Codex CLI is invoked in non-interactive (quiet) mode.
-        """
-        full_prompt = f"{self._system_prompt}\n\n{user_prompt}"
-        try:
-            result = subprocess.run(
-                ["codex", "--model", self.model, "--quiet", full_prompt],
-                capture_output=True,
-                text=True,
-                timeout=300,
-                env={**os.environ, "OPENAI_API_KEY": self.api_key},
-            )
-        except FileNotFoundError:
-            raise RuntimeError(
-                "Codex CLI not found. Install with: npm install -g @openai/codex"
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Codex CLI timed out after 300s")
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Codex CLI failed (rc={result.returncode}):\n{result.stderr}"
-            )
-        return result.stdout
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _load_knowledge(self, keys: list[str]) -> str:
         """Load and concatenate knowledge base documents."""
         if not keys:
-            # Load all available knowledge files
             docs = list(KNOWLEDGE_DIR.rglob("*.md"))
         else:
             docs = []
             for key in keys:
-                candidates = list(KNOWLEDGE_DIR.rglob(f"*{key}*"))
-                docs.extend(candidates)
+                docs.extend(KNOWLEDGE_DIR.rglob(f"*{key}*"))
 
         if not docs:
             return "(No knowledge documents loaded)"
@@ -171,13 +249,10 @@ class Sampler:
     @staticmethod
     def _extract_cpp(raw: str) -> str:
         """
-        Extract C++ code from the AI response.
-        Handles:
-          - Raw C++ (no fences)
-          - ```cpp ... ``` fences
-          - ``` ... ``` fences
+        Extract C++ code from AI response.
+        Handles fenced blocks and raw C++ output.
         """
-        # Try fenced code blocks first
+        # Try fenced code blocks
         fence_match = re.search(
             r"```(?:cpp|c\+\+)?\s*\n(.*?)```",
             raw,
@@ -186,5 +261,5 @@ class Sampler:
         if fence_match:
             return fence_match.group(1).strip()
 
-        # If no fences, assume the whole response is C++ (as instructed)
+        # Raw C++ — return as-is
         return raw.strip()
