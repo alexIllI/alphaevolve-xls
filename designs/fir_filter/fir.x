@@ -18,11 +18,11 @@ fn fir8(
     let p6 = (x6 as s32) * (h6 as s32);
     let p7 = (x7 as s32) * (h7 as s32);
     // Adder tree: two levels of reduction
-    let s01 = p0 + p1;
-    let s23 = p2 + p3;
-    let s45 = p4 + p5;
-    let s67 = p6 + p7;
-    let s0123 = s01 + s23;
-    let s4567 = s45 + s67;
-    s0123 + s4567
+    let t01 = p0 + p1;
+    let t23 = p2 + p3;
+    let t45 = p4 + p5;
+    let t67 = p6 + p7;
+    let t0123 = t01 + t23;
+    let t4567 = t45 + t67;
+    t0123 + t4567
 }

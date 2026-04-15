@@ -100,9 +100,8 @@ class XLSBuilder:
             self.bazel_bin,
             "build",
             "-c", "opt",
-            f"-j{self.bazel_jobs}",
+            "-j", str(self.bazel_jobs),
             "--show_progress_rate_limit=10",
-            "--noshow_loading_progress",
             *self.TARGETS,
         ]
 
