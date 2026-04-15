@@ -176,14 +176,18 @@ class Evaluator:
             if not result.success:
                 continue
 
-            ppa = extract_ppa(result.schedule_path, result.verilog_path)
+            ppa = extract_ppa(
+                result.schedule_path,
+                result.verilog_path,
+                result.block_metrics_path,    # ← NEW: use XLS block metrics
+            )
             if not ppa.feasible:
                 continue
 
             any_feasible = True
             total_stages += ppa.num_stages
-            total_regs += ppa.pipeline_reg_bits
-            max_delay = max(max_delay, ppa.max_stage_delay_ps)
+            total_regs   += ppa.flop_count          # use XLS-computed flop_count
+            max_delay     = max(max_delay, ppa.critical_path_ps)   # use real max delay
             max_min_clock = max(max_min_clock, ppa.min_clock_period_ps)
 
         if not any_feasible:
@@ -191,11 +195,12 @@ class Evaluator:
 
         agg = PPAMetrics(
             num_stages=total_stages,
-            pipeline_reg_bits=total_regs,
-            max_stage_delay_ps=max_delay,
+            flop_count=total_regs,
+            max_reg_to_reg_delay_ps=max_delay,
             min_clock_period_ps=max_min_clock,
             feasible=True,
         )
+        agg._compute()
         return agg
 
     @staticmethod
