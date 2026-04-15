@@ -8,8 +8,8 @@ num_islands: 4          # Number of independent island populations
 migration_interval: 5   # Every N iterations, share global best across islands
 
 # ── AI Sampler ────────────────────────────────────────────────────────────────
-ai_backend: "codex"     # 'openai' (Python SDK direct) or 'codex' (Codex CLI via npm)
-ai_model: "o3"          # Model passed to codex CLI --model flag
+ai_backend: "codex"     # 'codex' (Codex CLI v0.120 exec) or 'openai' (Python SDK)
+ai_model: "gpt-5.4"    # Model shown in codex TUI — accessible via education subscription
 max_tokens: 8192        # Max tokens for AI response
 
 # ── Mutation targets (which functions the AI evolves) ─────────────────────────
