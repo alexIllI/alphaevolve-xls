@@ -155,11 +155,12 @@ class Evaluator:
     def _run_pipeline_on_designs(self, iteration: int, island_id: int) -> PPAMetrics:
         """
         Run the XLS pipeline on all benchmark designs and aggregate PPA.
-        Aggregation: sum stages across designs (pressure test).
+        Primary source: benchmark_main (area_um2, critical_path_ps, pipeline_flops)
         """
         total_stages = 0
-        total_regs = 0
-        max_delay = 0
+        total_flops  = 0
+        total_area   = 0.0
+        max_delay    = 0
         max_min_clock = 0
         any_feasible = False
 
@@ -177,17 +178,19 @@ class Evaluator:
                 continue
 
             ppa = extract_ppa(
-                result.schedule_path,
-                result.verilog_path,
-                result.block_metrics_path,    # ← NEW: use XLS block metrics
+                schedule_path=result.schedule_path,
+                verilog_path=result.verilog_path,
+                block_metrics_path=result.block_metrics_path,
+                benchmark_output=result.benchmark_output,   # ← primary PPA source
             )
             if not ppa.feasible:
                 continue
 
-            any_feasible = True
+            any_feasible  = True
             total_stages += ppa.num_stages
-            total_regs   += ppa.flop_count          # use XLS-computed flop_count
-            max_delay     = max(max_delay, ppa.critical_path_ps)   # use real max delay
+            total_flops  += ppa.effective_flop_count
+            total_area   += ppa.total_area_um2
+            max_delay     = max(max_delay, ppa.critical_path_ps)
             max_min_clock = max(max_min_clock, ppa.min_clock_period_ps)
 
         if not any_feasible:
@@ -195,8 +198,10 @@ class Evaluator:
 
         agg = PPAMetrics(
             num_stages=total_stages,
-            flop_count=total_regs,
-            max_reg_to_reg_delay_ps=max_delay,
+            flop_count=total_flops,
+            total_area_um2=total_area,
+            total_pipeline_flops=total_flops,
+            critical_path_ps=max_delay,
             min_clock_period_ps=max_min_clock,
             feasible=True,
         )

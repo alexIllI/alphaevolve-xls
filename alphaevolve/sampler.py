@@ -4,7 +4,7 @@ alphaevolve/sampler.py
 Interfaces with the AI backend to generate C++ scheduling algorithm implementations.
 
 Backends:
-  1. codex  — `codex exec` (v0.120+) non-interactive mode, uses education/ChatGPT
+  1. codex  — `codex exec` (v0.120+) non-interactive mode, uses ChatGPT
                subscription auth set up when the user first ran `codex` interactively.
                Prompt piped via stdin, model response written to file via -o flag.
   2. openai — Python SDK direct API call with model fallback chain.

@@ -186,6 +186,7 @@ def main() -> int:
     pipeline = XLSPipeline(
         prebuilt_bin_dir=prebuilt,
         bazel_bin_dir=bazel_bin if builder.is_built() else None,
+        dslx_stdlib_path=xls_src / "xls" / "dslx" / "stdlib",  # for float32 etc.
     )
 
     # ── Check binary availability ─────────────────────────────────────────────
@@ -217,12 +218,20 @@ def main() -> int:
             )
             if result.success:
                 from alphaevolve.ppa_metrics import extract_ppa
-                ppa = extract_ppa(result.schedule_path, result.verilog_path)
+                ppa = extract_ppa(
+                    schedule_path=result.schedule_path,
+                    verilog_path=result.verilog_path,
+                    block_metrics_path=result.block_metrics_path,
+                    benchmark_output=result.benchmark_output,
+                )
+                bm_src = "benchmark_main" if result.benchmark_output else "schedule textproto"
                 console.print(
                     f"  [green]✓[/] {design.stem}: "
                     f"{ppa.num_stages} stages, "
-                    f"{ppa.pipeline_reg_bits} reg bits, "
-                    f"score={ppa.score:.0f}"
+                    f"{ppa.effective_flop_count} flops, "
+                    f"crit_path={ppa.critical_path_ps}ps, "
+                    f"area={ppa.total_area_um2:.1f}um², "
+                    f"score={ppa.score:.0f}  [dim]({bm_src})[/]"
                 )
             else:
                 console.print(f"  [red]✗[/] {design.stem}: {result.stderr[:200]}")
