@@ -115,6 +115,22 @@ def parse_args() -> argparse.Namespace:
         help="AI model name. Overrides evolve_config.yaml ai_model.",
     )
     parser.add_argument(
+        "--num_islands", type=int, default=None,
+        help=(
+            "Number of independent island populations. Overrides evolve_config.yaml. "
+            "Use 1 to disable island rotation (pure linear evolution, all iterations "
+            "on one island, simplest behaviour). Default: num_islands from config (4)."
+        ),
+    )
+    parser.add_argument(
+        "--island_id", type=int, default=None,
+        help=(
+            "Pin all iterations to a single island by ID (0-indexed). Useful for "
+            "debugging a specific mutation strategy without round-robin rotation. "
+            "E.g. --island_id 0 always uses island 0. Ignored if num_islands=1."
+        ),
+    )
+    parser.add_argument(
         "--dry_run", action="store_true",
         help="Run the pipeline without calling the AI (validates setup only).",
     )
@@ -276,11 +292,15 @@ def main() -> int:
         output_dir=output_dir / "eval_runs",
     )
 
+    # --num_islands 1  → single island, linear evolution (no rotation)
+    # --island_id N    → pin all iterations to island N (useful for debugging)
+    n_islands = args.num_islands if args.num_islands is not None else evo_cfg.get("num_islands", 4)
     island_mgr = IslandManager(
         db=db,
-        num_islands=evo_cfg.get("num_islands", 4),
+        num_islands=n_islands,
         migration_interval=evo_cfg.get("migration_interval", 5),
         mutation_types=evo_cfg.get("mutation_types", ["sdc_objective"]),
+        pinned_island_id=args.island_id,  # None = normal round-robin
     )
 
     # Save run config

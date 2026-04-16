@@ -54,10 +54,12 @@ class IslandManager:
         migration_interval: int = 5,
         mutation_types: list[str] | None = None,
         seed: int | None = None,
+        pinned_island_id: int | None = None,  # if set, always use this island
     ):
         self.db = db
         self.migration_interval = migration_interval
         self._rng = random.Random(seed)
+        self.pinned_island_id = pinned_island_id
 
         _mutation_types = mutation_types or ["sdc_objective", "delay_constraints"]
 
@@ -70,8 +72,21 @@ class IslandManager:
             for i in range(num_islands)
         ]
 
+        if pinned_island_id is not None and pinned_island_id >= len(self.islands):
+            raise ValueError(
+                f"--island_id {pinned_island_id} out of range "
+                f"(only {len(self.islands)} islands, ids 0–{len(self.islands)-1})"
+            )
+
     def select_island(self, iteration: int) -> Island:
-        """Round-robin island selection."""
+        """Return the island for this iteration.
+
+        - pinned_island_id set → always return that island (no rotation)
+        - num_islands == 1    → always island 0 (linear evolution)
+        - otherwise           → round-robin by iteration
+        """
+        if self.pinned_island_id is not None:
+            return self.islands[self.pinned_island_id]
         return self.islands[iteration % len(self.islands)]
 
     def select_parent(self, island: Island) -> Candidate | None:
