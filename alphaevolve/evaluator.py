@@ -38,6 +38,10 @@ MUTATION_TARGETS: dict[str, tuple[str, str]] = {
         "xls/scheduling/min_cut_scheduler.cc",
         "absl::StatusOr<ScheduleCycleMap> MinCutScheduler(",
     ),
+    "lifetime_constraints": (
+        "xls/scheduling/sdc_scheduler.cc",
+        "absl::Status SDCSchedulingModel::AddLifetimeConstraint(",
+    ),
 }
 
 
@@ -85,6 +89,7 @@ class Evaluator:
         target_file_rel, signature = MUTATION_TARGETS[mutation_type]
         target_file = self.xls_src / target_file_rel
         t_start = time.monotonic()
+        scheduling_strategy = self._scheduling_strategy_for(mutation_type)
 
         # ── Read original source ──────────────────────────────────────────────
         original_source = target_file.read_text(encoding="utf-8")
@@ -119,7 +124,9 @@ class Evaluator:
             )
 
         # ── Run XLS pipeline on all benchmark designs ─────────────────────────
-        aggregate_ppa = self._run_pipeline_on_designs(iteration, island_id)
+        aggregate_ppa = self._run_pipeline_on_designs(
+            iteration, island_id, scheduling_strategy
+        )
 
         # ── Restore original (we keep the best separately via diffs) ──────────
         self.builder.restore(target_file)
@@ -162,8 +169,13 @@ class Evaluator:
         target_file = self.xls_src / target_file_rel
         original_source = target_file.read_text(encoding="utf-8")
         t_start = time.monotonic()
+        scheduling_strategy = self._scheduling_strategy_for(mutation_type)
 
-        aggregate_ppa = self._run_pipeline_on_designs(iteration=-1, island_id=-1)
+        aggregate_ppa = self._run_pipeline_on_designs(
+            iteration=-1,
+            island_id=-1,
+            scheduling_strategy=scheduling_strategy,
+        )
 
         candidate = Candidate(
             iteration=-1,
@@ -185,7 +197,12 @@ class Evaluator:
         )
         return EvalResult(candidate=candidate, ppa=aggregate_ppa)
 
-    def _run_pipeline_on_designs(self, iteration: int, island_id: int) -> PPAMetrics:
+    def _run_pipeline_on_designs(
+        self,
+        iteration: int,
+        island_id: int,
+        scheduling_strategy: str,
+    ) -> PPAMetrics:
 
         """
         Run the XLS pipeline on all benchmark designs and aggregate PPA.
@@ -207,6 +224,7 @@ class Evaluator:
                 pipeline_stages=self.ppa_constraints.get("pipeline_stages"),
                 delay_model=self.ppa_constraints.get("delay_model", "unit"),
                 generator=self.ppa_constraints.get("generator", "pipeline"),
+                scheduling_strategy=scheduling_strategy,
             )
             if not result.success:
                 continue
@@ -241,6 +259,10 @@ class Evaluator:
         )
         agg._compute()
         return agg
+
+    @staticmethod
+    def _scheduling_strategy_for(mutation_type: str) -> str:
+        return "min_cut" if mutation_type == "min_cut" else "sdc"
 
     @staticmethod
     def _splice_function(source: str, signature: str, new_body: str) -> str | None:

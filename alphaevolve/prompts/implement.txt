@@ -2,6 +2,16 @@
 == CURRENT TASK ==
 Implement a new version of the function `{{ mutation_target }}` in XLS's SDC scheduler (xls/scheduling/sdc_scheduler.cc).
 
+== IMPORTANT SCHEDULER BEHAVIOR ==
+When XLS is not given a fixed pipeline length, SDCScheduler::Schedule() first minimizes
+pipeline length, then pins that minimum length, and only after that calls SetObjective().
+Implications:
+  - `SetObjective()` usually CANNOT reduce stage count in the default flow.
+  - `SetObjective()` mainly affects tie-breaking among minimum-stage schedules,
+    especially register pressure / lifetimes.
+  - `ComputeCombinationalDelayConstraints()` CAN affect feasibility and therefore
+    the minimum pipeline length.
+
 == CURRENT PPA SCORE ==
 Best score so far: {{ best_score }} (lower is better)
   ↳ {{ best_num_stages }} pipeline stages, {{ best_reg_bits }} register bits, {{ best_delay_ps }}ps critical path

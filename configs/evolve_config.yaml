@@ -4,7 +4,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Population ────────────────────────────────────────────────────────────────
-num_islands: 4          # Number of independent island populations
+num_islands: 1          # Keep the default search linear and easy to interpret
 migration_interval: 5   # Every N iterations, share global best across islands
 
 # ── AI Sampler ────────────────────────────────────────────────────────────────
@@ -13,20 +13,35 @@ ai_model: "gpt-5.4"    # Model shown in codex TUI — accessible via education s
 max_tokens: 8192        # Max tokens for AI response
 
 # ── Mutation targets (which functions the AI evolves) ─────────────────────────
-# Available: 'sdc_objective', 'delay_constraints', 'min_cut'
+# Available: 'sdc_objective', 'delay_constraints', 'min_cut', 'lifetime_constraints'
+# In single-island mode, keep this list to one target for the cleanest results.
 mutation_types:
-  - sdc_objective
   - delay_constraints
+  # - lifetime_constraints
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 bazel_jobs: 8           # Parallel Bazel jobs (set to your core count)
 max_build_retries: 3    # Per iteration: retry compile this many times with error feedback
 
 # ── PPA Scoring ───────────────────────────────────────────────────────────────
-# Score = num_stages * stage_weight + pipeline_reg_bits * reg_weight
+# Score = num_stages * stage_weight
+#       + pipeline_flops * power_weight
+#       + area_um2 * area_weight
+#       + critical_path_ps * delay_weight
 # Lower is better.
-stage_weight: 1000      # Stages are the primary optimization target
-reg_weight: 1           # Register bits secondary
+#
+# For scheduler evolution:
+# - `power_weight` uses pipeline flop bits as an optional proxy only
+# - default power weight is 0 because benchmark_main does not report real power
+# - `area_weight` is intentionally modest because benchmark_main total area is
+#   mostly structural IR area, which scheduling changes less directly
+# - `reg_weight` is still accepted as a backward-compatible alias for
+#   `power_weight`
+stage_weight: 200
+power_weight: 0
+area_weight: 1
+delay_weight: 1
+reg_weight: 1           # Deprecated alias for power_weight
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log_level: "INFO"       # DEBUG | INFO | WARNING

@@ -5,7 +5,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # XLS delay model: 'unit' (abstract, fast), 'sky130', 'asap7' (technology-specific)
-delay_model: "unit"
+delay_model: "asap7"
 
 # Target clock period in picoseconds.
 # The scheduler must fit all operations within this timing budget per stage.

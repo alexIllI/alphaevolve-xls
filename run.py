@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mutation_target",
-        choices=["sdc_objective", "delay_constraints", "min_cut"],
+        choices=["sdc_objective", "delay_constraints", "min_cut", "lifetime_constraints"],
         default=None,
         help="Which XLS function to evolve. Overrides evolve_config.yaml mutation_types.",
     )
@@ -154,6 +154,8 @@ def main() -> int:
     with open(args.evolve_config) as f:
         evo_cfg = yaml.safe_load(f)
 
+    from alphaevolve.ppa_metrics import configure_scoring
+
     # CLI overrides
     if args.mutation_target:
         evo_cfg["mutation_types"] = [args.mutation_target]
@@ -161,6 +163,16 @@ def main() -> int:
         evo_cfg["ai_backend"] = args.backend
     if args.model:
         evo_cfg["ai_model"] = args.model
+
+    # Score tuning for scheduler evolution.
+    # `power_weight` is the preferred config name; `reg_weight` is kept as a
+    # backwards-compatible alias for the pipeline-flop proxy term.
+    configure_scoring(
+        stage_weight=evo_cfg.get("stage_weight"),
+        flop_weight=evo_cfg.get("power_weight", evo_cfg.get("reg_weight")),
+        area_weight=evo_cfg.get("area_weight"),
+        delay_weight=evo_cfg.get("delay_weight"),
+    )
 
     # ── Output directory ──────────────────────────────────────────────────────
     if args.output_dir:
@@ -176,6 +188,13 @@ def main() -> int:
     console.print(f"  Iterations       : [green]{args.iterations}[/]")
     console.print(f"  AI backend       : [green]{evo_cfg['ai_backend']} / {evo_cfg['ai_model']}[/]")
     console.print(f"  Mutation targets : [green]{evo_cfg['mutation_types']}[/]")
+    console.print(
+        "  Score weights    : "
+        f"[green]stage={evo_cfg.get('stage_weight', 200)} "
+        f"power={evo_cfg.get('power_weight', evo_cfg.get('reg_weight', 1))} "
+        f"area={evo_cfg.get('area_weight', 1)} "
+        f"delay={evo_cfg.get('delay_weight', 1)}[/]"
+    )
     console.print()
 
     # ── Design files ──────────────────────────────────────────────────────────
@@ -295,11 +314,19 @@ def main() -> int:
     # --num_islands 1  → single island, linear evolution (no rotation)
     # --island_id N    → pin all iterations to island N (useful for debugging)
     n_islands = args.num_islands if args.num_islands is not None else evo_cfg.get("num_islands", 4)
+    mutation_types = list(evo_cfg.get("mutation_types", ["delay_constraints"]))
+    if n_islands == 1 and len(mutation_types) > 1:
+        selected = mutation_types[0]
+        console.print(
+            "[yellow]Single-island mode uses one mutation target only; "
+            f"selecting '{selected}'. Use --mutation_target to choose another.[/]"
+        )
+        mutation_types = [selected]
     island_mgr = IslandManager(
         db=db,
         num_islands=n_islands,
         migration_interval=evo_cfg.get("migration_interval", 5),
-        mutation_types=evo_cfg.get("mutation_types", ["sdc_objective"]),
+        mutation_types=mutation_types,
         pinned_island_id=args.island_id,  # None = normal round-robin
     )
 

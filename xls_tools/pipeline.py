@@ -319,8 +319,14 @@ def parse_benchmark_stdout(text: str) -> BenchmarkOutput:
         default=0,
     )
     # "nodes: N, delay: Xps"  — appears for every pipeline section regardless of stage count
+    stage_delay_matches = re.finditer(
+        r"(?:\[\s*Stage\s+\d+\]\s*nodes:\s*\d+,\s*delay:\s*(\d+)ps)|"
+        r"(?:^\s*nodes:\s*\d+,\s*delay:\s*(\d+)ps)",
+        text,
+        re.MULTILINE,
+    )
     cp_from_stages = max(
-        (int(m.group(1)) for m in re.finditer(r"delay:\s*(\d+)ps", text)),
+        (int(m.group(1) or m.group(2)) for m in stage_delay_matches),
         default=0,
     )
     critical_path_ps = max(cp_from_header, cp_from_stages)

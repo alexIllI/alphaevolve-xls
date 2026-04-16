@@ -61,7 +61,7 @@ class IslandManager:
         self._rng = random.Random(seed)
         self.pinned_island_id = pinned_island_id
 
-        _mutation_types = mutation_types or ["sdc_objective", "delay_constraints"]
+        _mutation_types = mutation_types or ["delay_constraints", "lifetime_constraints"]
 
         # Create islands, cycling through mutation types
         self.islands: list[Island] = [
@@ -143,8 +143,10 @@ class IslandManager:
                     "(ALAP - ASAP slack using distances_to_node_) and use it as an inverse "
                     "weight on the cycle_var term. Nodes with low mobility (critical) should "
                     "be scheduled ASAP; high-mobility nodes should be pushed toward stages "
-                    "that minimize register pressure. Use kObjectiveScaling to prevent "
-                    "the tie-breaker from dominating."
+                    "that minimize register pressure. Focus on reducing register bits among "
+                    "minimum-stage solutions; do not assume this objective can change the "
+                    "minimum pipeline length. Use kObjectiveScaling to prevent the "
+                    "tie-breaker from dominating."
                 ),
                 # Variation 1: balance resource utilization
                 (
@@ -152,8 +154,10 @@ class IslandManager:
                     "and, for each non-dead non-untimed node, add a term to the objective "
                     "that weights cycle_var_.at(node) by node->GetType()->GetFlatBitCount(). "
                     "This penalizes scheduling wide (expensive) nodes late, naturally "
-                    "balancing resource usage across stages. Use kObjectiveScaling as an "
-                    "overall coefficient. Also keep the last_stage minimization term."
+                    "balancing resource usage across stages. This is a secondary objective "
+                    "after pipeline length has already been minimized, so optimize for lower "
+                    "register pressure / area at fixed stage count. Use kObjectiveScaling "
+                    "as an overall coefficient."
                 ),
                 # Variation 2: minimize register bits weighted by fan-out
                 (
@@ -164,14 +168,15 @@ class IslandManager:
                 ),
                 # Variation 3: hierarchical objective
                 (
-                    "Implement a hierarchical objective using the existing LP variables: "
-                    "(1) Primary: minimize last_stage (the final pipeline stage count), "
-                    "weighted by 1e6 * kObjectiveScaling. "
-                    "(2) Secondary: minimize total register pressure by summing "
+                    "Implement a hierarchical objective using the existing LP variables, but "
+                    "treat this as a tie-breaker objective at fixed pipeline length. "
+                    "(1) Primary within the fixed-length solve: minimize total register "
+                    "pressure by summing "
                     "kObjectiveScaling * lifetime_var_.at(node) for all non-untimed nodes. "
-                    "(3) Tertiary: add kObjectiveScaling * 1e-6 * cycle_var_.at(node) as "
-                    "an ASAP tie-breaker. Combine all three into one LinearExpression and "
-                    "call model_.Minimize()."
+                    "(2) Secondary: add kObjectiveScaling * 1e-6 * cycle_var_.at(node) as "
+                    "an ASAP tie-breaker. Combine the terms into one LinearExpression and "
+                    "call model_.Minimize(). Do not rely on last_stage_ changing the "
+                    "minimum pipeline length in the default scheduling flow."
                 ),
             ],
             "delay_constraints": [
@@ -189,6 +194,22 @@ class IslandManager:
                     "the minimal constraint set, remove any constraint (a→b) that is already "
                     "implied by a chain of other constraints. This reduces LP problem size "
                     "and can speed up the solver while keeping the solution quality identical."
+                ),
+            ],
+            "lifetime_constraints": [
+                # Variation 0: fanout- and width-aware lifetime pressure
+                (
+                    "In AddLifetimeConstraint, preserve legality but increase the pressure on "
+                    "expensive long-lived values. Scale the lifetime pressure using both bit "
+                    "width and user fanout so wide values with many users are discouraged from "
+                    "staying live across stage boundaries."
+                ),
+                # Variation 1: sink-aware pressure for long-lived values
+                (
+                    "Revise AddLifetimeConstraint to penalize values that survive for many "
+                    "cycles or live all the way to the sink node. Keep the LP valid, but make "
+                    "farther user distances increasingly costly so the scheduler prefers "
+                    "placements with fewer live-out bits."
                 ),
             ],
         }

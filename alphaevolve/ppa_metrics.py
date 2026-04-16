@@ -11,10 +11,10 @@ Priority / source hierarchy:
   3. Verilog regex fallback (tertiary) — approximate register counting
 
 PPA Score (lower = better):
-    score = num_stages   * STAGE_WEIGHT
-          + flop_count   * FLOP_WEIGHT
-          + area_um2     * AREA_WEIGHT
-          + critical_path_ps * DELAY_WEIGHT
+    score = num_stages        * STAGE_WEIGHT
+          + pipeline_flops    * FLOP_WEIGHT
+          + area_um2          * AREA_WEIGHT
+          + critical_path_ps  * DELAY_WEIGHT
 """
 
 from __future__ import annotations
@@ -29,10 +29,39 @@ if TYPE_CHECKING:
 
 
 # ── Scoring weights ────────────────────────────────────────────────────────────
-STAGE_WEIGHT  = 1000    # pipeline stages (latency/throughput)
-FLOP_WEIGHT   = 1       # per-flipflop-bit (area proxy from XLS internals)
-AREA_WEIGHT   = 100     # per-um² from asap7 area model (set 0 to ignore)
-DELAY_WEIGHT  = 0       # delay already encoded in feasibility; raise to prefer speed
+#
+# Defaults are tuned for scheduler evolution:
+# - delay is important because scheduling directly changes stage balance
+# - total area is included, but at lower weight because benchmark_main's
+#   operation-area estimate is mostly structural IR area and often changes less
+#   than schedule-dependent metrics
+# - stage count remains a latency proxy, but is no longer dominant
+# - power is disabled by default because benchmark_main does not provide a
+#   direct power metric; callers may opt into the pipeline-flop proxy if desired
+STAGE_WEIGHT = 200.0
+FLOP_WEIGHT = 0.0
+AREA_WEIGHT = 1.0
+DELAY_WEIGHT = 1.0
+
+
+def configure_scoring(
+    *,
+    stage_weight: float | None = None,
+    flop_weight: float | None = None,
+    area_weight: float | None = None,
+    delay_weight: float | None = None,
+) -> None:
+    """Override module scoring weights for the current process."""
+    global STAGE_WEIGHT, FLOP_WEIGHT, AREA_WEIGHT, DELAY_WEIGHT
+
+    if stage_weight is not None:
+        STAGE_WEIGHT = float(stage_weight)
+    if flop_weight is not None:
+        FLOP_WEIGHT = float(flop_weight)
+    if area_weight is not None:
+        AREA_WEIGHT = float(area_weight)
+    if delay_weight is not None:
+        DELAY_WEIGHT = float(delay_weight)
 
 
 @dataclass
