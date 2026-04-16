@@ -133,10 +133,12 @@ class IslandManager:
                 ),
                 # Variation 1: balance resource utilization
                 (
-                    "Implement a resource-balancing objective: count the expected number of "
-                    "nodes per stage, and add a term that penalizes scheduling decisions "
-                    "that would leave stages unbalanced (too many operations in one stage vs "
-                    "another). This helps reduce the critical path within a stage."
+                    "Implement a resource-balancing objective: iterate over graph_.nodes() "
+                    "and, for each non-dead non-untimed node, add a term to the objective "
+                    "that weights cycle_var_.at(node) by node->GetType()->GetFlatBitCount(). "
+                    "This penalizes scheduling wide (expensive) nodes late, naturally "
+                    "balancing resource usage across stages. Use kObjectiveScaling as an "
+                    "overall coefficient. Also keep the last_stage minimization term."
                 ),
                 # Variation 2: minimize register bits weighted by fan-out
                 (
@@ -147,10 +149,14 @@ class IslandManager:
                 ),
                 # Variation 3: hierarchical objective
                 (
-                    "Implement a hierarchical objective: first minimize pipeline stages "
-                    "(highest priority), then minimize total register bits (medium), then "
-                    "apply an ASAP tie-breaker (lowest). Use very different scaling factors "
-                    "(e.g. 1e6, 1e3, 1) to keep the priorities strict."
+                    "Implement a hierarchical objective using the existing LP variables: "
+                    "(1) Primary: minimize last_stage (the final pipeline stage count), "
+                    "weighted by 1e6 * kObjectiveScaling. "
+                    "(2) Secondary: minimize total register pressure by summing "
+                    "kObjectiveScaling * lifetime_var_.at(node) for all non-untimed nodes. "
+                    "(3) Tertiary: add kObjectiveScaling * 1e-6 * cycle_var_.at(node) as "
+                    "an ASAP tie-breaker. Combine all three into one LinearExpression and "
+                    "call model_.Minimize()."
                 ),
             ],
             "delay_constraints": [
