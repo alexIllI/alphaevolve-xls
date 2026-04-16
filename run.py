@@ -298,28 +298,29 @@ def main() -> int:
     console.rule("[bold cyan]Seeding Islands with Baseline PPA")
     console.print("  Evaluating original sdc_scheduler.cc (no AI mutation)...")
 
-    seeded_mutation_types = set()
+    baseline_by_mt: dict = {}  # mutation_type → EvalResult, computed once per mt
     for island in island_mgr.islands:
         mt = island.mutation_type
-        if mt in seeded_mutation_types:
-            # Already seeded this mutation type — reuse that baseline candidate
-            continue
-        seeded_mutation_types.add(mt)
-        with console.status(f"  [yellow]Baseline pipeline for mutation_type={mt}...[/]"):
-            baseline = evaluator.evaluate_baseline(mt)
-        if baseline.ppa.feasible:
-            db.add_candidate(baseline.candidate)
-            island_mgr.record(baseline.candidate, island)
-            best_score = min(best_score, baseline.candidate.ppa_score)
-            console.print(
-                f"  [green]✓[/] {mt} baseline: "
-                f"{baseline.candidate.num_stages} stages, "
-                f"crit_path={baseline.ppa.critical_path_ps}ps, "
-                f"area={baseline.ppa.total_area_um2:.1f}um², "
-                f"score={baseline.candidate.ppa_score:.0f}"
-            )
-        else:
-            console.print(f"  [yellow]⚠[/] {mt} baseline pipeline failed — islands start cold")
+        if mt not in baseline_by_mt:
+            with console.status(f"  [yellow]Baseline pipeline for mutation_type={mt}...[/]"):
+                baseline = evaluator.evaluate_baseline(mt)
+            baseline_by_mt[mt] = baseline
+            if baseline.ppa.feasible:
+                db.insert(baseline.candidate)  # correct method: insert(), not add_candidate()
+                console.print(
+                    f"  [green]✓[/] {mt} baseline: "
+                    f"{baseline.candidate.num_stages} stages, "
+                    f"crit_path={baseline.ppa.critical_path_ps}ps, "
+                    f"area={baseline.ppa.total_area_um2:.1f}um², "
+                    f"score={baseline.candidate.ppa_score:.0f}"
+                )
+            else:
+                console.print(f"  [yellow]⚠[/] {mt} baseline pipeline failed — islands start cold")
+        # Seed every island for this mt (not just the first one found)
+        bl = baseline_by_mt[mt]
+        if bl.ppa.feasible:
+            island_mgr.record(bl.candidate, island)
+            best_score = min(best_score, bl.candidate.ppa_score)
 
     console.print()
     # ── Evolution loop ─────────────────────────────────────────────────────────
