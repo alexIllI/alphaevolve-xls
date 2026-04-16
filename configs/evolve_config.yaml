@@ -20,6 +20,7 @@ mutation_types:
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 bazel_jobs: 8           # Parallel Bazel jobs (set to your core count)
+max_build_retries: 3    # Per iteration: retry compile this many times with error feedback
 
 # ── PPA Scoring ───────────────────────────────────────────────────────────────
 # Score = num_stages * stage_weight + pipeline_reg_bits * reg_weight

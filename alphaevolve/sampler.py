@@ -63,6 +63,7 @@ class Sampler:
         parent_reg_bits: int,
         parent_delay_ps: int,
         knowledge_keys: list[str] | None = None,
+        compile_error: str | None = None,   # set on retry so AI can fix its mistake
     ) -> str:
         """Generate a new C++ implementation. Returns the raw C++ string."""
         knowledge_context = self._load_knowledge(knowledge_keys or [])
@@ -82,6 +83,7 @@ class Sampler:
             parent_reg_bits=parent_reg_bits,
             parent_delay_ps=parent_delay_ps,
             knowledge_context=knowledge_context,
+            compile_error=compile_error,    # None on first attempt
         )
 
         if self.backend == "codex":
@@ -90,6 +92,7 @@ class Sampler:
             raw = self._call_openai(user_prompt)
 
         return self._extract_cpp(raw)
+
 
     # ── Codex CLI backend (primary) ────────────────────────────────────────────
 

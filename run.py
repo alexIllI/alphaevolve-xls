@@ -350,35 +350,68 @@ def main() -> int:
             f"best_score={best_score:.0f}"
         )
 
-        # ── Sample new algorithm from AI ─────────────────────────────────────
-        try:
-            generated_code = sampler.sample(
-                mutation_target=mutation_type,
-                mutation_instruction=mutation_instruction,
-                current_function_source=current_source,
-                sdc_scheduler_source=sdc_source,
-                best_score=best_score,
-                best_num_stages=parent_stages,
-                best_reg_bits=parent_regs,
-                best_delay_ps=parent_delay,
-                parent_score=parent_score,
-                parent_num_stages=parent_stages,
-                parent_reg_bits=parent_regs,
-                parent_delay_ps=parent_delay,
-            )
-        except Exception as e:
-            log.error(f"AI sampling failed: {e}")
-            continue
+        max_retries = evo_cfg.get("max_build_retries", 3)
+        last_compile_error: str | None = None
+        result = None
 
-        # ── Evaluate (patch → build → run → score) ────────────────────────────
-        with console.status(f"[yellow]Building XLS (incremental)...[/]"):
-            result = evaluator.evaluate(
-                iteration=iteration,
-                island_id=island.id,
-                parent_id=parent.id if parent else None,
-                mutation_type=mutation_type,
-                generated_code=generated_code,
-            )
+        for attempt in range(1, max_retries + 1):
+            attempt_label = f"attempt {attempt}/{max_retries}" if attempt > 1 else ""
+
+            # ── Sample new algorithm from AI ──────────────────────────────────
+            try:
+                generated_code = sampler.sample(
+                    mutation_target=mutation_type,
+                    mutation_instruction=mutation_instruction,
+                    current_function_source=current_source,
+                    sdc_scheduler_source=sdc_source,
+                    best_score=best_score,
+                    best_num_stages=parent_stages,
+                    best_reg_bits=parent_regs,
+                    best_delay_ps=parent_delay,
+                    parent_score=parent_score,
+                    parent_num_stages=parent_stages,
+                    parent_reg_bits=parent_regs,
+                    parent_delay_ps=parent_delay,
+                    compile_error=last_compile_error,   # None on first attempt
+                )
+            except Exception as e:
+                log.error(f"AI sampling failed: {e}")
+                break   # sampling itself failed — no point retrying
+
+            # ── Evaluate (patch → build → run → score) ────────────────────────
+            status_label = f"[yellow]Building XLS{' (retry)' if attempt > 1 else ''}...[/]"
+            with console.status(status_label):
+                result = evaluator.evaluate(
+                    iteration=iteration,
+                    island_id=island.id,
+                    parent_id=parent.id if parent else None,
+                    mutation_type=mutation_type,
+                    generated_code=generated_code,
+                )
+
+            c = result.candidate
+
+            if c.build_status == "success":
+                break   # ✓ compiled — exit retry loop
+
+            # Extract compile error for next attempt
+            last_compile_error = c.notes or "Build failed (no error details)"
+            # Trim to the most useful part: just the clang errors
+            if "error:" in last_compile_error:
+                error_lines = [
+                    l for l in last_compile_error.splitlines()
+                    if "error:" in l or "note:" in l
+                ]
+                last_compile_error = "\n".join(error_lines[:30])
+
+            if attempt < max_retries:
+                console.print(
+                    f"  [yellow]⟳ compile failed (attempt {attempt}/{max_retries}), "
+                    f"sending error to AI for retry...[/]"
+                )
+
+        if result is None:
+            continue   # AI sampling failed entirely, skip iteration
 
         c = result.candidate
         island_mgr.record(c, island)
@@ -402,6 +435,7 @@ def main() -> int:
             (output_dir / "best_algorithm.patch").write_text(c.source_diff)
 
         island_mgr.maybe_migrate(iteration)
+
 
     # ── Save final results ─────────────────────────────────────────────────────
     console.rule("[bold cyan]Evolution Complete")

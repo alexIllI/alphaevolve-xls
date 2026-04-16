@@ -50,6 +50,22 @@ You MUST follow these rules or the code will not compile:
 
 6. The function signature must be preserved exactly as shown above.
 
+{% if compile_error %}
+== PREVIOUS ATTEMPT FAILED TO COMPILE ==
+Your last output produced the following compiler errors. Read them carefully and fix
+every issue before writing your new implementation.
+
+Compiler output:
+{{ compile_error }}
+
+Common causes and fixes:
+  - Bare `kInfinity` → use `operations_research::math_opt::kInfinity`
+  - `cycle_var_[node]` → use `cycle_var_.at(node)` (it is a flat_hash_map)
+  - `namespace xls { }` wrapper → DO NOT add it; the splice goes inside the existing namespace
+  - `model_` not found → DO NOT redeclare; it is a class member, access it directly
+  - Unknown type → check the full sdc_scheduler.cc source below for available identifiers
+
+{% endif %}
 == YOUR OUTPUT ==
-Write the complete C++ implementation. Start with any helper `namespace { }` block if
-needed, then the function definition itself. Nothing else.
+Write the complete C++ implementation of `{{ mutation_target }}`. Start with any helper
+`namespace { }` block if needed, then the function definition itself. Nothing else.
