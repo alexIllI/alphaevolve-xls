@@ -9,7 +9,7 @@
 
 This project applies an **AlphaEvolve-inspired evolutionary loop** to automatically discover better pipeline scheduling algorithms inside [Google XLS](https://github.com/google/xls) — an open-source High-Level Synthesis (HLS) toolchain.
 
-**The core idea**: An AI agent (via Codex CLI / OpenAI) reads the XLS scheduling source code, understands the current algorithm (SDC LP formulation), and proposes improved C++ implementations informed by research papers. Each candidate is compiled incrementally via Bazel (~2–3 min), evaluated on benchmark hardware designs, and scored on PPA (pipeline stages, area in um², critical path delay). The best algorithms are retained and used as parents for the next generation.
+**The core idea**: An AI agent (via Codex CLI / OpenAI) reads the XLS scheduling source code, understands the current algorithm (SDC LP formulation), and proposes improved C++ implementations informed by research papers. Each candidate is compiled incrementally via Bazel (~30–90s), evaluated on benchmark hardware designs, and scored on PPA (pipeline stages, area in um², critical path delay). The best algorithms are retained and used as parents for the next generation.
 
 **What makes it real**: PPA metrics come directly from `benchmark_main` (XLS's own benchmark tool), using the `asap7` area model and unit delay model — not from heuristics or regex.
 
@@ -22,7 +22,7 @@ alphaevolve-xls/
 ├── run.py                    ← Main CLI entry point
 ├── configs/
 │   ├── ppa_constraints.yaml  ← Clock period, delay model, area model
-│   └── evolve_config.yaml    ← Islands, AI backend, iteration settings
+│   └── evolve_config.yaml    ← Islands, AI backend, retry settings
 ├── designs/
 │   ├── mac/mac.x             ← 32-bit multiply-accumulate
 │   ├── fir_filter/fir.x      ← 8-tap FIR filter
@@ -33,7 +33,7 @@ alphaevolve-xls/
 │   ├── evaluator.py          ← patch → build → run → extract PPA
 │   ├── ppa_metrics.py        ← Parse benchmark_main output for PPA
 │   ├── database.py           ← SQLite candidate store
-│   ├── islands.py            ← Island-based population management
+│   ├── islands.py            ← Population management (island model)
 │   └── prompts/              ← System + Jinja2 templates for AI
 ├── xls_tools/
 │   ├── build.py              ← Incremental Bazel build wrapper
@@ -77,7 +77,7 @@ cp .env.example .env
 
 ## Build XLS from Source (one-time, ~2–6 hours)
 
-This is required to mutate and rebuild the scheduler. Do this once; subsequent builds are incremental (~2–3 min).
+This is required to mutate and rebuild the scheduler. Do this once; subsequent builds are incremental (~30–90s per iteration).
 
 ```bash
 cd /mnt/d/final/xls
@@ -90,7 +90,7 @@ bazel build -c opt \
   //xls/dev_tools:benchmark_main
 ```
 
-> **Note:** `benchmark_main` is the largest target (~122 MB, pulls in LLVM/JIT). It provides real area (asap7) and critical path delay metrics. The build may take 1–2 additional hours beyond the other tools.
+> **Note:** `benchmark_main` is the largest target (~122 MB, pulls in LLVM/JIT). It provides real area (asap7) and critical path delay metrics. This target is built **once** and reused across all iterations — it is never rebuilt per iteration, which is why incremental builds are fast.
 
 ---
 
@@ -119,23 +119,38 @@ DRY RUN — testing pipeline only (no AI calls)
 Dry run complete.
 ```
 
+> **Note on matmul_4x4 area = 0:** matmul_4x4 is a proc-network design. `benchmark_main` only reports area for the top-level entry proc (which is an empty scheduler shell). The 72ps critical path IS real and is the scheduling signal. Add `--extra_designs mac dot` to get meaningful area scores in the evolution.
+
 ---
 
 ## Run the Evolution
 
-Evolve using mac as primary benchmark, with codex backend
+**Recommended starting point — linear evolution, single island, with compile retries:**
 ```bash
 python run.py \
-  --input_file designs/mac/mac.x \
-  --extra_designs designs/dot_product/dot.x \
+  --input_file designs/matmul4x4/matmul_4x4.x \
+  --extra_designs designs/mac/mac.x designs/dot_product/dot.x \
   --iterations 20 \
-  --output_dir results/mac_exp_001 \
+  --num_islands 1 \
+  --output_dir results/exp_001 \
   --xls_src /mnt/d/final/xls \
   --backend codex \
   --mutation_target sdc_objective
 ```
 
-Or use OpenAI API directly
+**Multi-island evolution (more diversity, default config):**
+```bash
+python run.py \
+  --input_file designs/mac/mac.x \
+  --extra_designs designs/dot_product/dot.x \
+  --iterations 40 \
+  --output_dir results/islands_001 \
+  --xls_src /mnt/d/final/xls \
+  --backend codex \
+  --mutation_target sdc_objective
+```
+
+**OpenAI API directly:**
 ```bash
 python run.py \
   --input_file designs/mac/mac.x \
@@ -155,16 +170,29 @@ python run.py [OPTIONS]
 Required:
   --input_file PATH         Primary DSLX design file (.x)
 
-Optional:
-  --extra_designs PATHS     Additional benchmark designs (space-separated)
-  --ppa_constraints PATH    PPA constraints YAML (default: configs/ppa_constraints.yaml)
-  --evolve_config PATH      Evolution config YAML (default: configs/evolve_config.yaml)
+Evolution control:
   --iterations N            Evolution iterations (default: 10)
-  --output_dir PATH         Results directory (default: results/<timestamp>)
-  --xls_src PATH            XLS source clone (default: $XLS_SRC_PATH or /mnt/d/final/xls)
-  --mutation_target NAME    Function to evolve: sdc_objective | delay_constraints | min_cut
+  --mutation_target NAME    Function: sdc_objective | delay_constraints | min_cut
+
+Island / population mode:
+  --num_islands N           Number of island populations (default: 4 from config).
+                            Use --num_islands 1 for simple linear evolution with no
+                            island rotation — all iterations run on one population.
+  --island_id N             Pin ALL iterations to island N (0-indexed). Useful for
+                            debugging one mutation strategy in isolation.
+
+AI backend:
   --backend NAME            AI backend: openai | codex (default: from evolve_config.yaml)
   --model NAME              AI model name (default: from evolve_config.yaml)
+
+Paths:
+  --extra_designs PATHS     Additional DSLX designs for PPA evaluation (space-separated)
+  --ppa_constraints PATH    PPA constraints YAML (default: configs/ppa_constraints.yaml)
+  --evolve_config PATH      Evolution config YAML (default: configs/evolve_config.yaml)
+  --output_dir PATH         Results directory (default: results/<timestamp>)
+  --xls_src PATH            XLS source clone (default: $XLS_SRC_PATH or /mnt/d/final/xls)
+
+Other:
   --dry_run                 Validate pipeline only, no AI calls
   --log_level LEVEL         DEBUG | INFO | WARNING (default: INFO)
 ```
@@ -174,21 +202,30 @@ Optional:
 ## How the Evolution Works
 
 ```
+Startup:
+  0. Build benchmark_main ONCE (skipped if already on disk)
+  0. Evaluate baseline sdc_scheduler.cc → seed all islands with real PPA score
+
 For each iteration:
-  1. Select island (round-robin) + parent candidate (tournament selection)
-  2. Build prompt: current algorithm source + PPA score + paper excerpts + instruction
-  3. AI generates new C++ implementation of target function
-  4. Patch xls/scheduling/sdc_scheduler.cc with generated code
-  5. Bazel incremental build (~2-3 min, only changed files recompiled)
-  6. Run XLS pipeline on each benchmark design:
+  1. Select island (round-robin, or pinned via --island_id / --num_islands 1)
+  2. Select parent: best candidate in island (or global best if island is empty)
+  3. Build prompt: current algorithm source + PPA score + research excerpts + instruction
+  4. AI generates new C++ implementation of target function
+  --- Compile-retry loop (up to max_build_retries=3) ---
+  5. Patch xls/scheduling/sdc_scheduler.cc with generated code
+  6. Bazel incremental build (~30–90s, only sdc_scheduler.cc + dependents)
+     If compile fails → send exact clang errors back to AI → retry up to 3×
+  7. Run XLS pipeline on each benchmark design:
        DSLX → IR → opt → benchmark_main (PPA) → codegen (Verilog)
-  7. Extract PPA from benchmark_main: critical_path_ps, area_um2, flops
-  8. Score = stages×1000 + flops×1 + area×100  (lower is better)
-  9. If improved: save diff to database, propagate to islands
-  10. Restore original sdc_scheduler.cc
+  8. Extract PPA: critical_path_ps (benchmark_main), area_um2, stages, flops
+  9. Score = stages×1000 + flops×1 + area×0.1  (lower is better)
+  10. Record in SQLite; if improved: save patch to best_algorithm.patch
+  11. Restore original sdc_scheduler.cc
 ```
 
-**What `--scheduling_strategy=sdc` does:** Forces `benchmark_main` and `codegen_main` to use the SDC scheduler (`sdc_scheduler.cc`) — the file we mutate. Every PPA measurement reflects the AI's proposed algorithm.
+**Why compile retries matter:** If the AI generates non-compilable code, the iteration would be wasted. Instead, the exact clang error is fed back to the AI which can pinpoint and fix the specific identifier or namespace issue on the next attempt.
+
+**What `--scheduling_strategy=sdc` does:** Forces `codegen_main` to use the SDC scheduler (`sdc_scheduler.cc`) — the file we mutate. Every PPA measurement reflects the AI's proposed algorithm.
 
 **Mutation targets:**
 | Target | C++ Function | What Changes |
@@ -196,6 +233,13 @@ For each iteration:
 | `sdc_objective` | `SDCSchedulingModel::SetObjective()` | What the LP minimizes (stages, registers, delay, weighted) |
 | `delay_constraints` | `ComputeCombinationalDelayConstraints()` | How timing constraints are added between operations |
 | `min_cut` | `MinCutScheduler::Schedule()` | Alternative: skip LP, use graph partitioning instead |
+
+**Build speed breakdown:**
+| Phase | Time | Frequency |
+|-------|------|-----------|
+| `benchmark_main` (LLVM-heavy) | 1–2 hours | Once at startup |
+| `codegen_main` + `opt_main` + `ir_converter_main` | 30–90s | Every iteration |
+| XLS pipeline (IR → PPA → Verilog) | 5–30s | Every iteration |
 
 ---
 
@@ -205,7 +249,7 @@ For each iteration:
 |--------|--------|-----------|------|-------|
 | `mac` (32-bit MAC) | 1 | 2 ps | 426 um² | 43,728 |
 | `dot` (8-elem dot product) | 1 | 15 ps | 3,386 um² | 339,888 |
-| `matmul_4x4` (4×4 float32 systolic) | 1 | 72 ps | — | 1,000 |
+| `matmul_4x4` (4×4 float32 systolic) | 1 | 72 ps | — (proc-network) | 1,000 |
 
 When the scheduler improves, these scores go down.
 
@@ -225,7 +269,7 @@ Each run produces in `--output_dir`:
 
 Apply the best result permanently:
 ```bash
-patch /mnt/d/final/xls/xls/scheduling/sdc_scheduler.cc < results/mac_exp_001/best_algorithm.patch
+patch /mnt/d/final/xls/xls/scheduling/sdc_scheduler.cc < results/exp_001/best_algorithm.patch
 ```
 
 ---
