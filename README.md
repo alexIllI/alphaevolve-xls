@@ -123,8 +123,8 @@ Dry run complete.
 
 ## Run the Evolution
 
+Evolve using mac as primary benchmark, with codex backend
 ```bash
-# Evolve using mac as primary benchmark, with codex backend
 python run.py \
   --input_file designs/mac/mac.x \
   --extra_designs designs/dot_product/dot.x \
@@ -133,8 +133,10 @@ python run.py \
   --xls_src /mnt/d/final/xls \
   --backend codex \
   --mutation_target sdc_objective
+```
 
-# Or use OpenAI API directly
+Or use OpenAI API directly
+```bash
 python run.py \
   --input_file designs/mac/mac.x \
   --iterations 20 \

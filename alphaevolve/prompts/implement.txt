@@ -1,6 +1,6 @@
 {# Jinja2 template — rendered by sampler.py before each Codex CLI call #}
 == CURRENT TASK ==
-Implement a new version of the function `{{ mutation_target }}` in XLS's SDC scheduler.
+Implement a new version of the function `{{ mutation_target }}` in XLS's SDC scheduler (xls/scheduling/sdc_scheduler.cc).
 
 == CURRENT PPA SCORE ==
 Best score so far: {{ best_score }} (lower is better)
@@ -18,10 +18,38 @@ Parent candidate score: {{ parent_score }}
 == CURRENT FUNCTION SOURCE (what you are replacing) ==
 {{ current_function_source }}
 
-== XLS SCHEDULING SOURCE CONTEXT ==
-The following is the full current sdc_scheduler.cc for reference:
+== FULL sdc_scheduler.cc FOR CONTEXT ==
+Study this carefully for available types, member variables, and constants before writing code.
 {{ sdc_scheduler_source }}
 
+== STRICT OUTPUT RULES ==
+Your output will be spliced DIRECTLY into sdc_scheduler.cc at the exact location of the
+function above. The file already has:
+  - `namespace xls {` at the top — do NOT add it again
+  - All necessary #includes — do NOT add includes
+  - Class definition for SDCSchedulingModel already visible
+
+You MUST follow these rules or the code will not compile:
+
+1. DO NOT wrap your output in `namespace xls { }` or any other namespace.
+   Just write the function(s) directly, as they appear in the file.
+
+2. DO NOT redeclare the class or any members. Member variables (e.g. `model_`,
+   `cycle_var_`, `lifetime_var_`, `graph_`, `stage_var_`) are accessible directly
+   because the function is a method of SDCSchedulingModel. Use them without `this->`.
+
+3. Use only identifiers that appear in the sdc_scheduler.cc source above.
+   Fully-qualify any OR-Tools names, e.g.:
+     - `operations_research::math_opt::kInfinity`  (not bare `kInfinity`)
+     - `math_opt::LinearExpression`  (already aliased via `using` in the file)
+
+4. Helper functions: you may add private helper functions above the main function.
+   They must be placed inside an anonymous `namespace { }` block (NOT `namespace xls`).
+
+5. DO NOT output markdown fences (no ```cpp). Output raw C++ only.
+
+6. The function signature must be preserved exactly as shown above.
+
 == YOUR OUTPUT ==
-Write the complete C++ implementation of `{{ mutation_target }}`. Include any private
-helper functions needed. Preserve the exact function signature. Output C++ only.
+Write the complete C++ implementation. Start with any helper `namespace { }` block if
+needed, then the function definition itself. Nothing else.

@@ -152,7 +152,41 @@ class Evaluator:
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
+    def evaluate_baseline(self, mutation_type: str) -> EvalResult:
+        """
+        Evaluate the UNMODIFIED sdc_scheduler.cc (no AI mutation) and return a
+        baseline Candidate with iteration=-1.  Called once before the evolution loop
+        to seed islands, so the AI always has a valid compilable parent to build on.
+        """
+        target_file_rel, _ = MUTATION_TARGETS[mutation_type]
+        target_file = self.xls_src / target_file_rel
+        original_source = target_file.read_text(encoding="utf-8")
+        t_start = time.monotonic()
+
+        aggregate_ppa = self._run_pipeline_on_designs(iteration=-1, island_id=-1)
+
+        candidate = Candidate(
+            iteration=-1,
+            island_id=-1,
+            parent_id=None,
+            mutation_type=mutation_type,
+            target_file=target_file_rel,
+            source_diff="",
+            generated_code="(baseline — original XLS code)",
+            build_status="success" if aggregate_ppa.feasible else "run_failed",
+            num_stages=aggregate_ppa.num_stages,
+            pipeline_reg_bits=aggregate_ppa.pipeline_reg_bits,
+            max_stage_delay_ps=aggregate_ppa.max_stage_delay_ps,
+            min_clock_period_ps=aggregate_ppa.min_clock_period_ps,
+            ppa_score=aggregate_ppa.score,
+            build_duration_s=0.0,
+            total_duration_s=time.monotonic() - t_start,
+            notes="Baseline: original unmodified sdc_scheduler.cc",
+        )
+        return EvalResult(candidate=candidate, ppa=aggregate_ppa)
+
     def _run_pipeline_on_designs(self, iteration: int, island_id: int) -> PPAMetrics:
+
         """
         Run the XLS pipeline on all benchmark designs and aggregate PPA.
         Primary source: benchmark_main (area_um2, critical_path_ps, pipeline_flops)

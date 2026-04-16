@@ -278,11 +278,40 @@ def main() -> int:
     sdc_src_path = xls_src / "xls" / "scheduling" / "sdc_scheduler.cc"
     sdc_source = sdc_src_path.read_text(encoding="utf-8")
 
-    # ── Evolution loop ─────────────────────────────────────────────────────────
-    console.rule("[bold cyan]Starting Evolution Loop")
-
     best_score = float("inf")
     best_candidate_id = None
+
+    # ── Seed islands with baseline (original un-mutated code) ─────────────────
+    console.rule("[bold cyan]Seeding Islands with Baseline PPA")
+    console.print("  Evaluating original sdc_scheduler.cc (no AI mutation)...")
+
+    seeded_mutation_types = set()
+    for island in island_mgr.islands:
+        mt = island.mutation_type
+        if mt in seeded_mutation_types:
+            # Already seeded this mutation type — reuse that baseline candidate
+            continue
+        seeded_mutation_types.add(mt)
+        with console.status(f"  [yellow]Baseline pipeline for mutation_type={mt}...[/]"):
+            baseline = evaluator.evaluate_baseline(mt)
+        if baseline.ppa.feasible:
+            db.add_candidate(baseline.candidate)
+            island_mgr.record(baseline.candidate, island)
+            best_score = min(best_score, baseline.candidate.ppa_score)
+            console.print(
+                f"  [green]✓[/] {mt} baseline: "
+                f"{baseline.candidate.num_stages} stages, "
+                f"crit_path={baseline.ppa.critical_path_ps}ps, "
+                f"area={baseline.ppa.total_area_um2:.1f}um², "
+                f"score={baseline.candidate.ppa_score:.0f}"
+            )
+        else:
+            console.print(f"  [yellow]⚠[/] {mt} baseline pipeline failed — islands start cold")
+
+    console.print()
+    # ── Evolution loop ─────────────────────────────────────────────────────────
+
+    console.rule("[bold cyan]Starting Evolution Loop")
 
     for iteration in range(args.iterations):
         island = island_mgr.select_island(iteration)
