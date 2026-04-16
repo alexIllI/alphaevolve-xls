@@ -32,13 +32,21 @@ class BuildResult:
 class XLSBuilder:
     """Manages incremental Bazel builds of XLS codegen_main."""
 
-    # Targets needed for the full DSLX→Verilog pipeline + optional benchmark
-    # NOTE: ir_converter_main lives under dslx/ir_convert, not tools
-    # benchmark_main: in dev_tools; gives area/delay estimates (built for future use)
+    # ── Build target groups ────────────────────────────────────────────────────
+    # TARGETS: rebuilt every AI iteration (only changed .cc + their link deps)
+    # These are lightweight — no LLVM/JIT, relinking is fast (~30-60s incremental)
     TARGETS = [
         "//xls/tools:codegen_main",
         "//xls/tools:opt_main",
         "//xls/dslx/ir_convert:ir_converter_main",
+    ]
+
+    # STATIC_TARGETS: built ONCE at startup, never rebuilt per iteration.
+    # benchmark_main links against LLVM/JIT (122 MB binary). Since we are not
+    # changing benchmark algorithm code, it can reuse the pre-built binary even
+    # after sdc_scheduler.cc is mutated. Area/delay metrics are gate-library
+    # estimates that are stable for 1-stage designs at a wide clock period.
+    STATIC_TARGETS = [
         "//xls/dev_tools:benchmark_main",
     ]
 
@@ -93,18 +101,30 @@ class XLSBuilder:
 
     # ── Build ──────────────────────────────────────────────────────────────────
 
+    def build_static(self) -> BuildResult:
+        """
+        Build static targets (benchmark_main etc.) once at startup.
+        These are NOT rebuilt on every iteration — only on first run.
+        """
+        return self._run_build(self.STATIC_TARGETS, timeout=7200)  # 2h for first LLVM compile
+
     def build(self) -> BuildResult:
         """
-        Run an incremental Bazel build of the codegen pipeline targets.
+        Run an incremental Bazel build of the per-iteration targets only
+        (codegen_main, opt_main, ir_converter_main — NO benchmark_main).
         Returns BuildResult with success flag, duration, and logs.
         """
+        return self._run_build(self.TARGETS, timeout=900)  # 15 min max
+
+    def _run_build(self, targets: list[str], timeout: int) -> BuildResult:
+        """Internal: run `bazel build -c opt -j N <targets>`."""
         cmd = [
             self.bazel_bin,
             "build",
             "-c", "opt",
             "-j", str(self.bazel_jobs),
             "--show_progress_rate_limit=10",
-            *self.TARGETS,
+            *targets,
         ]
 
         start = time.monotonic()
@@ -114,7 +134,7 @@ class XLSBuilder:
                 cwd=self.xls_src,
                 capture_output=True,
                 text=True,
-                timeout=600,  # 10 min max for an incremental build
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired as e:
             elapsed = time.monotonic() - start

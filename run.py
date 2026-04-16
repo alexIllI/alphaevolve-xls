@@ -189,6 +189,19 @@ def main() -> int:
         dslx_stdlib_path=xls_src / "xls" / "dslx" / "stdlib",  # for float32 etc.
     )
 
+    # ── Ensure static tools are built once (benchmark_main, etc.) ────────────
+    bm_path = xls_src / "bazel-bin" / "xls" / "dev_tools" / "benchmark_main"
+    if not bm_path.exists():
+        console.print("[yellow]benchmark_main not found — building static targets (one-time, may take a while)...[/]")
+        static_result = builder.build_static()
+        if not static_result.success:
+            console.print("[red]WARNING:[/] benchmark_main build failed — area metrics unavailable.")
+            console.print(f"  [dim]{static_result.stderr[-300:]}[/]")
+        else:
+            console.print(f"[green]✓[/] Static tools built in {static_result.duration_seconds:.0f}s")
+    else:
+        console.print(f"[dim]benchmark_main already built, skipping static build[/]")
+
     # ── Check binary availability ─────────────────────────────────────────────
     if not builder.is_built():
         if prebuilt and (prebuilt / "codegen_main").exists():
