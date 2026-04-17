@@ -2,6 +2,10 @@
 results/
 plan/
 !results/.gitkeep
+*.bak
+*.head
+*.head2
+*.tail
 
 # Python
 __pycache__/
