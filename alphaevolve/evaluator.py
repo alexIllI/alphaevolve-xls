@@ -205,15 +205,17 @@ class Evaluator:
         max_min_clock = 0
         any_feasible = False
 
+        per_design_overrides = self.ppa_constraints.get("per_design", {})
         for design in self.design_files:
+            cstr = {**self.ppa_constraints, **per_design_overrides.get(design.stem, {})}
             run_dir = self.output_dir / f"iter{iteration:04d}_island{island_id}" / design.stem
             result = self.pipeline.run(
                 dslx_file=design,
                 output_dir=run_dir,
-                clock_period_ps=self.ppa_constraints.get("clock_period_ps", 1000),
-                pipeline_stages=self.ppa_constraints.get("pipeline_stages"),
-                delay_model=self.ppa_constraints.get("delay_model", "unit"),
-                generator=self.ppa_constraints.get("generator", "pipeline"),
+                clock_period_ps=cstr.get("clock_period_ps", 1000),
+                pipeline_stages=cstr.get("pipeline_stages"),
+                delay_model=cstr.get("delay_model", "unit"),
+                generator=cstr.get("generator", "pipeline"),
                 ppa_mode=self.ppa_mode,
             )
             if not result.success:

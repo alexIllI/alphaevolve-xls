@@ -217,3 +217,26 @@ class XLSBuilder:
     def is_built(self, tool: str = "codegen_main") -> bool:
         """Check whether the XLS binary has been built."""
         return self.binary_path(tool).exists()
+
+    def supports_agent_strategy(self, tool: str = "codegen_main") -> bool:
+        """
+        Return True if the binary already recognises --scheduling_strategy=agent.
+
+        Probe: run the binary with only --scheduling_strategy=agent and no input
+        file.  Flag validation fires before any I/O, so the process exits in
+        ~50 ms either way.  If stderr contains "Unknown scheduling strategy" the
+        flag is not registered; any other exit (e.g. "no input file") means it is.
+        """
+        binary = self.binary_path(tool)
+        if not binary.exists():
+            return False
+        try:
+            result = subprocess.run(
+                [str(binary), "--scheduling_strategy=agent"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return "Unknown scheduling strategy" not in result.stderr
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False

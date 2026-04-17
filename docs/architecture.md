@@ -2,7 +2,7 @@
 
 > Last updated: 2026-04-17 — reflects the agent-scheduler-only refactor and the `--ppa_mode` flag.
 
-This doc is the reference for how AlphaEvolve-XLS is wired together. The companion doc `plan/plan.txt` is the short version of the design decisions. `README.md` is the user-facing guide; this file is the internals guide.
+This doc is the reference for how AlphaEvolve-XLS is wired together. `README.md` is the user-facing guide; this file is the internals guide.
 
 ---
 
@@ -354,12 +354,12 @@ Prints a human-readable report including `Critical path delay`, `Total area`, `T
 
 ## Part 5 — `--ppa_mode` matrix
 
-| Mode      | PPA source                                 | Rebuilds `benchmark_main`? | Score terms that can be non-zero       | Status         |
-|-----------|--------------------------------------------|---------------------------|-----------------------------------------|----------------|
-| `fast`    | `block_metrics` textproto                  | No                        | stages, pipeline_reg_bits               | Implemented    |
-| `medium`  | (planned) `yosys -p "synth; stat"` on Verilog | No                    | stages, reg_bits, gate_count            | Placeholder    |
-| `slow`    | `benchmark_main` stdout (asap7 area model) | Yes, per iteration        | stages, reg_bits, area_um2, delay_ps    | Implemented    |
-| `slowest` | (planned) Yosys `synth_asap7` + OpenROAD    | No (needs Yosys/OpenROAD)| stages, reg_bits, true-silicon area, WNS| Placeholder    |
+| Mode      | PPA source                                    | Rebuilds `benchmark_main`? | Score terms that can be non-zero         | Status      |
+| --------- | --------------------------------------------- | -------------------------- | ---------------------------------------- | ----------- |
+| `fast`    | `block_metrics` textproto                     | No                         | stages, pipeline_reg_bits                | Implemented |
+| `medium`  | (planned) `yosys -p "synth; stat"` on Verilog | No                         | stages, reg_bits, gate_count             | Placeholder |
+| `slow`    | `benchmark_main` stdout (asap7 area model)    | Yes, per iteration         | stages, reg_bits, area_um2, delay_ps     | Implemented |
+| `slowest` | (planned) Yosys `synth_asap7` + OpenROAD      | No (needs Yosys/OpenROAD)  | stages, reg_bits, true-silicon area, WNS | Placeholder |
 
 Implementation references:
 
@@ -387,13 +387,13 @@ Score = num_stages        * stage_weight
 
 Lower is better. Defaults from `configs/evolve_config.yaml`:
 
-| Weight          | Default | Notes                                                                                  |
-|-----------------|---------|----------------------------------------------------------------------------------------|
-| `stage_weight`  | 200     | Pipeline depth is the primary signal — stages are cheap in `fast`, always meaningful.  |
-| `power_weight`  | 0       | Pipeline flop bits as a proxy for switching-power cost. Off by default.                |
-| `reg_weight`    | 1       | Deprecated alias for `power_weight`. Still read for backward compatibility.            |
-| `area_weight`   | 1       | Only meaningful with `ppa_mode=slow` (area comes from asap7). Otherwise area=0.        |
-| `delay_weight`  | 1       | Critical-path picoseconds.                                                             |
+| Weight         | Default | Notes                                                                                 |
+| -------------- | ------- | ------------------------------------------------------------------------------------- |
+| `stage_weight` | 200     | Pipeline depth is the primary signal — stages are cheap in `fast`, always meaningful. |
+| `power_weight` | 0       | Pipeline flop bits as a proxy for switching-power cost. Off by default.               |
+| `reg_weight`   | 1       | Deprecated alias for `power_weight`. Still read for backward compatibility.           |
+| `area_weight`  | 1       | Only meaningful with `ppa_mode=slow` (area comes from asap7). Otherwise area=0.       |
+| `delay_weight` | 1       | Critical-path picoseconds.                                                            |
 
 Aggregation across multiple designs (see `evaluator._run_pipeline_on_designs`):
 

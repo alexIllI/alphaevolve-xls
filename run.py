@@ -73,6 +73,16 @@ def parse_args() -> argparse.Namespace:
              "specified in --extra_designs.",
     )
     parser.add_argument(
+        "--clock_period", type=int, required=True,
+        help=(
+            "Target clock period in picoseconds. The scheduler must fit all operations "
+            "within this timing budget per pipeline stage. This value is a fixed "
+            "constraint — it is never modified by the evolution process. "
+            "Example: --clock_period 1000  (1 ns, suitable for most arithmetic designs). "
+            "Wide multipliers or float FMA units may require 1500–2000 ps."
+        ),
+    )
+    parser.add_argument(
         "--extra_designs", nargs="*", default=[],
         help="Optional additional DSLX designs to include in PPA evaluation.",
     )
@@ -186,6 +196,10 @@ def main() -> int:
     if args.ppa_mode:
         evo_cfg["ppa_mode"] = args.ppa_mode
 
+    # Clock period comes exclusively from --clock_period; it is a fixed constraint
+    # and is never modified by the evolution process or the AI agent.
+    ppa_cfg["clock_period_ps"] = args.clock_period
+
     # Resolve the active ppa_mode. Default is "fast" — codegen_main only.
     ppa_mode = str(evo_cfg.get("ppa_mode", "fast")).lower()
     if ppa_mode not in ("fast", "medium", "slow", "slowest"):
@@ -222,6 +236,7 @@ def main() -> int:
     console.print(f"  Iterations       : [green]{args.iterations}[/]")
     console.print(f"  AI backend       : [green]{evo_cfg['ai_backend']} / {evo_cfg['ai_model']}[/]")
     console.print(f"  Mutation targets : [green]{evo_cfg['mutation_types']}[/]")
+    console.print(f"  Clock period     : [green]{args.clock_period} ps[/]")
     console.print(f"  PPA mode         : [green]{ppa_mode}[/]")
     console.print(
         "  Score weights    : "
@@ -260,12 +275,7 @@ def main() -> int:
     )
 
     # benchmark_main is only needed for ppa_mode in ("slow", "slowest").
-    # It is also used for the --dry_run sanity check so we still verify the
-    # binary is present when the user asks for it.
-    needs_benchmark_main = (
-        args.dry_run
-        or ppa_mode in ("slow", "slowest")
-    )
+    needs_benchmark_main = ppa_mode in ("slow", "slowest")
 
     # ── Ensure static tools are built once (benchmark_main, etc.) ────────────
     bm_path = xls_src / "bazel-bin" / "xls" / "dev_tools" / "benchmark_main"
@@ -298,7 +308,7 @@ def main() -> int:
             console.print("[red]WARNING:[/] XLS runtime bootstrap build failed.")
             console.print(f"  [dim]{static_result.stderr[-300:]}[/]")
         else:
-            console.print(f"[green]?/] XLS runtime tools built in {static_result.duration_seconds:.0f}s")
+            console.print(f"[green]✓[/] XLS runtime tools built in {static_result.duration_seconds:.0f}s")
 
     if not all(builder.is_built(tool) for tool in ("codegen_main", "opt_main", "ir_converter_main")):
         if prebuilt and (prebuilt / "codegen_main").exists():
@@ -307,7 +317,6 @@ def main() -> int:
             console.print(f"[dim]  Run: cd {xls_src} && bazel build -c opt //xls/tools:...[/]")
             if not args.dry_run:
                 console.print("[red]  Cannot evolve algorithms without a source build.[/]")
-                console.print("[yellow]  Use --dry_run to test the pipeline with pre-built binaries.[/]")
                 return 1
         else:
             console.print("[red]ERROR:[/] No XLS binary found (neither built nor pre-built).")
@@ -316,15 +325,30 @@ def main() -> int:
 
     # ── Dry run: just validate the pipeline ───────────────────────────────────
     if args.dry_run:
+        os.environ["XLS_AGENT_DRY_RUN"] = "1"
         console.print("[bold yellow]DRY RUN — testing pipeline only (no AI calls)[/]")
+        # Only rebuild if the current binary doesn't recognise --scheduling_strategy=agent.
+        # The probe exits in ~50 ms, so subsequent dry_runs skip the build entirely.
+        if not builder.supports_agent_strategy():
+            console.print("[dim]Agent strategy not in binary — rebuilding (incremental, fast)...[/]")
+            dry_build = builder.build(targets=XLSBuilder.AGENT_ITERATION_TARGETS)
+            if not dry_build.success:
+                console.print(f"[red]Dry-run build failed:[/]\n{dry_build.stderr[-500:]}")
+                os.environ.pop("XLS_AGENT_DRY_RUN", None)
+                return 1
+            console.print(f"[green]✓[/] Agent scheduler built in {dry_build.duration_seconds:.0f}s")
+        else:
+            console.print("[dim]Agent strategy already in binary, skipping rebuild[/]")
+        _per_design = ppa_cfg.get("per_design", {})
         for design in design_files:
+            cstr = {**ppa_cfg, **_per_design.get(design.stem, {})}
             run_dir = output_dir / "dry_run" / design.stem
             result = pipeline.run(
                 dslx_file=design,
                 output_dir=run_dir,
-                clock_period_ps=ppa_cfg.get("clock_period_ps", 1000),
-                delay_model=ppa_cfg.get("delay_model", "unit"),
-                generator=ppa_cfg.get("generator", "pipeline"),
+                clock_period_ps=cstr.get("clock_period_ps", 1000),
+                delay_model=cstr.get("delay_model", "unit"),
+                generator=cstr.get("generator", "pipeline"),
                 ppa_mode=ppa_mode,
             )
             if result.success:
@@ -346,6 +370,7 @@ def main() -> int:
                 )
             else:
                 console.print(f"  [red]✗[/] {design.stem}: {result.stderr[:200]}")
+        os.environ.pop("XLS_AGENT_DRY_RUN", None)
         console.print("[bold green]Dry run complete.[/]")
         return 0
 

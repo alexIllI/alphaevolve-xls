@@ -1,16 +1,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # ppa_constraints.yaml
 # PPA targets for the XLS codegen pipeline.
-# These constraints are passed to codegen_main and used for design evaluation.
+#
+# NOTE: clock_period_ps is NOT set here. It is always supplied via the
+# --clock_period CLI flag so each run has an explicit, fixed constraint that
+# the evolution process never modifies. Choose it based on your design:
+#   simple arithmetic (mac, dot)  →  ~1000 ps
+#   wide multipliers / float FMA  →  1500–2000 ps
 # ─────────────────────────────────────────────────────────────────────────────
 
 # XLS delay model: 'unit' (abstract, fast), 'sky130', 'asap7' (technology-specific)
 delay_model: "asap7"
-
-# Target clock period in picoseconds.
-# The scheduler must fit all operations within this timing budget per stage.
-# Lower → more pipeline stages required → harder constraint.
-clock_period_ps: 1000
 
 # Force a fixed number of pipeline stages (null = let the scheduler decide).
 # Set to an integer to constrain the search (e.g. 3 means exactly 3 stages).
@@ -19,3 +19,11 @@ pipeline_stages: null
 # Codegen mode: 'pipeline' (multi-stage) or 'combinational' (single stage).
 # Must be 'pipeline' for multi-stage PPA evaluation.
 generator: "pipeline"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-design constraint overrides.
+# Keys must match the DSLX file stem (filename without .x).
+# Use these to override pipeline_stages or generator for specific designs.
+# clock_period_ps cannot be overridden here — use --clock_period on the CLI.
+# ─────────────────────────────────────────────────────────────────────────────
+per_design: {}
