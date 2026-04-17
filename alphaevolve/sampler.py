@@ -52,8 +52,8 @@ class Sampler:
         self,
         mutation_target: str,
         mutation_instruction: str,
-        current_function_source: str,
-        sdc_scheduler_source: str,
+        current_source: str,
+        reference_source_bundle: str,
         best_score: float,
         best_num_stages: int,
         best_reg_bits: int,
@@ -64,16 +64,24 @@ class Sampler:
         parent_delay_ps: int,
         knowledge_keys: list[str] | None = None,
         compile_error: str | None = None,   # set on retry so AI can fix its mistake
+        target_file_path: str = "",
     ) -> str:
         """Generate a new C++ implementation. Returns the raw C++ string."""
         knowledge_context = self._load_knowledge(knowledge_keys or [])
 
-        template = self._jinja.get_template("implement.txt")
+        template_name = (
+            "implement_agent_scheduler.txt"
+            if mutation_target == "agent_scheduler"
+            else "implement.txt"
+        )
+        template = self._jinja.get_template(template_name)
         user_prompt = template.render(
             mutation_target=mutation_target,
             mutation_instruction=mutation_instruction,
-            current_function_source=current_function_source,
-            sdc_scheduler_source=sdc_scheduler_source,
+            current_function_source=current_source,
+            current_source=current_source,
+            sdc_scheduler_source=reference_source_bundle,
+            reference_source_bundle=reference_source_bundle,
             best_score=best_score,
             best_num_stages=best_num_stages,
             best_reg_bits=best_reg_bits,
@@ -84,6 +92,7 @@ class Sampler:
             parent_delay_ps=parent_delay_ps,
             knowledge_context=knowledge_context,
             compile_error=compile_error,    # None on first attempt
+            target_file_path=target_file_path,
         )
 
         if self.backend == "codex":

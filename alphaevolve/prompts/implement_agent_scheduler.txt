@@ -1,0 +1,76 @@
+{# Jinja2 template for a standalone agent-generated XLS scheduler #}
+== CURRENT TASK ==
+Implement a new standalone XLS scheduling algorithm in `{{ target_file_path }}` by
+writing the complete body of `{{ mutation_target }}`.
+
+This function is selected by XLS when `--scheduling_strategy=agent` is used.
+Your code must return a legal `ScheduleCycleMap` for the given design.
+
+== DESIGN GOAL ==
+Create a real scheduling algorithm, not a parameter tweak:
+- combine ideas from existing XLS schedulers and literature into a hybrid heuristic
+- change how nodes are prioritized / packed / spread across stages
+- aim to improve generated hardware PPA by changing the schedule itself
+
+Think in AlphaEvolve-style terms:
+- produce a distinct heuristic family, not just small constant changes
+- keep the algorithm deterministic and compilable
+- reuse existing XLS bounds/constraint machinery rather than rebuilding all infrastructure
+- prefer a coherent strategy such as pressure-aware list scheduling, mobility-aware
+  placement, multi-pass refinement, or greedy schedule repair
+
+== CURRENT PPA SCORE ==
+Best score so far: {{ best_score }} (lower is better)
+  ↳ {{ best_num_stages }} pipeline stages, {{ best_reg_bits }} register bits, {{ best_delay_ps }}ps critical path
+
+Parent candidate score: {{ parent_score }}
+  ↳ {{ parent_num_stages }} stages, {{ parent_reg_bits }} register bits, {{ parent_delay_ps }}ps
+
+== MUTATION INSTRUCTION ==
+{{ mutation_instruction }}
+
+== RELEVANT ALGORITHMS FROM LITERATURE ==
+{{ knowledge_context }}
+
+== CURRENT SCHEDULER SOURCE ==
+{{ current_source }}
+
+== REFERENCE XLS SOURCES ==
+Use these to understand the API contract, available helpers, and how other
+schedulers behave. You may borrow ideas, but produce your own coherent
+algorithm.
+{{ reference_source_bundle }}
+
+== STRICT OUTPUT RULES ==
+Your output will be spliced directly into `{{ target_file_path }}` at the exact
+location of the target function.
+
+You MUST follow these rules or the code will not compile:
+1. Preserve the function signature exactly.
+2. Do NOT add `#include` lines.
+3. Do NOT wrap the output in `namespace xls {}`.
+4. You may add helper functions before the main function, preferably in an
+   anonymous `namespace {}` block.
+5. Use only identifiers and APIs visible in the current source and references.
+6. Prefer existing XLS utilities over inventing new infrastructure.
+7. Do not emit markdown fences or prose.
+
+Compile-safety guidance:
+- Keep the algorithm self-contained inside this file.
+- Prefer standard XLS/Abseil containers and helper routines already used nearby.
+- If you need staged assignment, work through `sched::ScheduleBounds` and return
+  a final `ScheduleCycleMap`.
+- If retrying after a compiler failure, fix the specific C++ issue first and only
+  then change algorithm details.
+
+{% if compile_error %}
+== PREVIOUS ATTEMPT FAILED TO COMPILE ==
+Compiler output:
+{{ compile_error }}
+
+Fix every compiler issue before writing the next version.
+{% endif %}
+
+== YOUR OUTPUT ==
+Write raw C++ only: any helper `namespace {}` block first, then the complete
+definition of `{{ mutation_target }}`.

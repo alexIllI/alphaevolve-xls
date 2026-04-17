@@ -1,5 +1,6 @@
 # Results and generated artifacts
 results/
+plan/
 !results/.gitkeep
 
 # Python

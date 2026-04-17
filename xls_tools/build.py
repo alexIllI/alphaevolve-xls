@@ -32,23 +32,58 @@ class BuildResult:
 class XLSBuilder:
     """Manages incremental Bazel builds of XLS codegen_main."""
 
+    TOOL_PATHS = {
+        "ir_converter_main": "xls/dslx/ir_convert/ir_converter_main",
+        "opt_main": "xls/tools/opt_main",
+        "codegen_main": "xls/tools/codegen_main",
+        "benchmark_main": "xls/dev_tools/benchmark_main",
+    }
+
     # ── Build target groups ────────────────────────────────────────────────────
-    # TARGETS: rebuilt every AI iteration (only changed .cc + their link deps)
-    # These are lightweight — no LLVM/JIT, relinking is fast (~30-60s incremental)
-    TARGETS = [
+    # Every iteration rebuilds the agent_generated_scheduler library and the
+    # tools that link against it. codegen_main must be relinked after any
+    # scheduler change; opt_main / ir_converter_main are listed so they stay
+    # in sync with a fresh XLS tree after a clean build.
+    BOOTSTRAP_TARGETS = [
+        "//xls/scheduling:agent_generated_scheduler",
         "//xls/tools:codegen_main",
         "//xls/tools:opt_main",
         "//xls/dslx/ir_convert:ir_converter_main",
     ]
 
-    # STATIC_TARGETS: built ONCE at startup, never rebuilt per iteration.
-    # benchmark_main links against LLVM/JIT (122 MB binary). Since we are not
-    # changing benchmark algorithm code, it can reuse the pre-built binary even
-    # after sdc_scheduler.cc is mutated. Area/delay metrics are gate-library
-    # estimates that are stable for 1-stage designs at a wide clock period.
-    STATIC_TARGETS = [
+    ITERATION_TARGETS = [
+        "//xls/scheduling:agent_generated_scheduler",
+        "//xls/tools:codegen_main",
+        "//xls/tools:opt_main",
+        "//xls/dslx/ir_convert:ir_converter_main",
+    ]
+
+    # The fastest iteration target set — only what codegen_main needs.
+    AGENT_ITERATION_TARGETS = [
+        "//xls/scheduling:agent_generated_scheduler",
+        "//xls/tools:codegen_main",
+    ]
+
+    # benchmark_main links against LLVM/JIT (~122 MB binary). It is only
+    # needed when ppa_mode == "slow"; in that case it joins the per-iteration
+    # rebuild so asap7 metrics reflect the latest scheduler.
+    BENCHMARK_TARGETS = [
         "//xls/dev_tools:benchmark_main",
     ]
+
+    @classmethod
+    def iteration_targets_for_mode(cls, ppa_mode: str) -> list[str]:
+        """
+        Return the per-iteration rebuild list for the chosen PPA mode.
+            fast / medium : agent scheduler + codegen_main (no benchmark_main).
+            slow          : include benchmark_main so asap7 metrics refresh.
+            slowest       : currently same as slow (Yosys/OpenROAD happen
+                            outside Bazel).
+        """
+        base = list(cls.AGENT_ITERATION_TARGETS)
+        if ppa_mode in ("slow", "slowest"):
+            base.extend(cls.BENCHMARK_TARGETS)
+        return base
 
     def __init__(
         self,
@@ -101,20 +136,27 @@ class XLSBuilder:
 
     # ── Build ──────────────────────────────────────────────────────────────────
 
-    def build_static(self) -> BuildResult:
+    def build_bootstrap(self, include_benchmark_main: bool = False) -> BuildResult:
         """
         Build static targets (benchmark_main etc.) once at startup.
         These are NOT rebuilt on every iteration — only on first run.
         """
-        return self._run_build(self.STATIC_TARGETS, timeout=7200)  # 2h for first LLVM compile
+        targets = list(self.BOOTSTRAP_TARGETS)
+        if include_benchmark_main:
+            targets.extend(self.BENCHMARK_TARGETS)
+        return self._run_build(targets, timeout=7200)  # 2h for first LLVM compile
 
-    def build(self) -> BuildResult:
+    def build_static(self) -> BuildResult:
+        """Backward-compatible wrapper for older call sites."""
+        return self.build_bootstrap(include_benchmark_main=True)
+
+    def build(self, targets: list[str] | None = None) -> BuildResult:
         """
         Run an incremental Bazel build of the per-iteration targets only
         (codegen_main, opt_main, ir_converter_main — NO benchmark_main).
         Returns BuildResult with success flag, duration, and logs.
         """
-        return self._run_build(self.TARGETS, timeout=900)  # 15 min max
+        return self._run_build(targets or self.ITERATION_TARGETS, timeout=900)  # 15 min max
 
     def _run_build(self, targets: list[str], timeout: int) -> BuildResult:
         """Internal: run `bazel build -c opt -j N <targets>`."""
@@ -169,7 +211,8 @@ class XLSBuilder:
 
     def binary_path(self, tool: str = "codegen_main") -> Path:
         """Return the path to a built XLS binary."""
-        return self.xls_src / "bazel-bin" / "xls" / "tools" / tool
+        rel = self.TOOL_PATHS.get(tool, f"xls/tools/{tool}")
+        return self.xls_src / "bazel-bin" / rel
 
     def is_built(self, tool: str = "codegen_main") -> bool:
         """Check whether the XLS binary has been built."""

@@ -3,14 +3,17 @@ xls_tools/pipeline.py
 ─────────────────────
 Runs the full XLS DSLX → IR → opt → (codegen + benchmark_main) pipeline.
 
-benchmark_main is the primary PPA source:
-  - Critical path delay (ps) from the delay model
-  - Total area (um²) from the asap7 area model
-  - Total pipeline flops (bits)
-  - Per-stage delay and flop breakdown
+The scheduling strategy is always ``agent`` — we do not use sdc / min_cut /
+random / asap from this harness. The AI-evolved code lives in
+``xls/scheduling/agent_generated_scheduler.cc`` and is dispatched by XLS when
+``--scheduling_strategy=agent`` is passed.
 
-codegen_main is still run to produce Verilog + block_metrics as secondary source.
---scheduling_strategy=sdc on both ensures the mutated SDC scheduler is used.
+PPA mode controls how much work is done per iteration:
+  - fast     (default): codegen_main only; parse block_metrics textproto for
+                        pipeline_stages and total_pipeline_registers.
+  - medium  : run Yosys `synth; stat` on the Verilog (future).
+  - slow    : rebuild + run benchmark_main for asap7 area + delay.
+  - slowest : Yosys synth_asap7 + OpenROAD (future).
 """
 
 from __future__ import annotations
@@ -150,17 +153,26 @@ class XLSPipeline:
         delay_model: str = "unit",
         area_model: str = "asap7",
         generator: str = "pipeline",
-        scheduling_strategy: str = "sdc",
+        ppa_mode: str = "fast",
+        # The legacy parameters below are ignored — scheduling strategy is now
+        # hard-coded to ``agent`` and benchmark_main is only invoked when
+        # ppa_mode=="slow". They are kept in the signature for backward
+        # compatibility with existing callers.
+        scheduling_strategy: str | None = None,
+        use_benchmark_main: bool | None = None,
     ) -> PipelineResult:
         """
-        Full DSLX → Verilog + PPA pipeline.
+        Full DSLX → Verilog + PPA pipeline. Always uses --scheduling_strategy=agent.
 
-        Runs:
+        Stages:
           1. ir_converter_main  (.x → .ir)
           2. opt_main           (.ir → .opt.ir)
-          3. benchmark_main     (.opt.ir → PPA stdout) [primary PPA source]
-          4. codegen_main       (.opt.ir → .v + schedule + block_metrics) [Verilog]
+          3. benchmark_main     [only if ppa_mode=="slow"] — asap7 area + delay
+          4. codegen_main       (.opt.ir → .v + schedule + block_metrics)
         """
+        # Force agent strategy regardless of caller arguments.
+        scheduling_strategy = "agent"
+        run_benchmark_main = (ppa_mode == "slow")
         dslx_file = Path(dslx_file)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -220,7 +232,7 @@ class XLSPipeline:
         # ── Stage 3: benchmark_main → primary PPA report ─────────────────────────
         benchmark_out = None
         bm_bin = self._bin("benchmark_main")
-        if bm_bin:
+        if run_benchmark_main and bm_bin:
             bm_cmd = [
                 bm_bin, str(opt_ir_path),
                 # No --top: auto-detected from package top set by ir_converter_main
@@ -247,7 +259,12 @@ class XLSPipeline:
                 benchmark_out = parsed
                 benchmark_out.raw_stdout = bm_text
         else:
-            benchmark_log_path.write_text("benchmark_main not built yet\n", encoding="utf-8")
+            message = (
+                f"benchmark_main skipped (ppa_mode={ppa_mode})\n"
+                if not run_benchmark_main
+                else "benchmark_main not built yet\n"
+            )
+            benchmark_log_path.write_text(message, encoding="utf-8")
 
         # ── Stage 4: codegen_main → Verilog + block_metrics ─────────────────────
         codegen_cmd = [

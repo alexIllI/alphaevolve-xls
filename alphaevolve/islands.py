@@ -61,7 +61,7 @@ class IslandManager:
         self._rng = random.Random(seed)
         self.pinned_island_id = pinned_island_id
 
-        _mutation_types = mutation_types or ["delay_constraints", "lifetime_constraints"]
+        _mutation_types = mutation_types or ["agent_scheduler"]
 
         # Create islands, cycling through mutation types
         self.islands: list[Island] = [
@@ -135,84 +135,58 @@ class IslandManager:
         Returns a mutation instruction string for the AI, varying by island
         and iteration to encourage exploration of different algorithmic ideas.
         """
+        # Mutation target: AgentGeneratedScheduler() in
+        # xls/scheduling/agent_generated_scheduler.cc.
+        # Available APIs the variants can lean on:
+        #   TopoSort(f), IsUntimed(node)
+        #   bounds->lb(node), bounds->ub(node)
+        #   bounds->TightenNodeLb/Ub(node, cycle), bounds->PropagateBounds()
+        #   delay_estimator.GetOperationDelayInPs(node)
+        #   node->operands(), node->users(), node->GetType()->GetFlatBitCount()
         instructions = {
-            "sdc_objective": [
-                # Variation 0: force-directed weighting
+            "agent_scheduler": [
+                # Variation 0: register-pressure-aware list scheduler
                 (
-                    "Implement a force-directed objective: compute each node's mobility "
-                    "(ALAP - ASAP slack using distances_to_node_) and use it as an inverse "
-                    "weight on the cycle_var term. Nodes with low mobility (critical) should "
-                    "be scheduled ASAP; high-mobility nodes should be pushed toward stages "
-                    "that minimize register pressure. Focus on reducing register bits among "
-                    "minimum-stage solutions; do not assume this objective can change the "
-                    "minimum pipeline length. Use kObjectiveScaling to prevent the "
-                    "tie-breaker from dominating."
+                    "Implement a register-pressure-aware list scheduler. Visit nodes via "
+                    "TopoSort(f), skip IsUntimed(node), and for each node pick a cycle in "
+                    "[bounds->lb(node), bounds->ub(node)] that minimises boundary register "
+                    "cost — operands that would be registered across stage boundaries "
+                    "weighted by node->GetType()->GetFlatBitCount(), plus users that would "
+                    "be forced to later stages. After each placement call "
+                    "bounds->TightenNodeLb/Ub and bounds->PropagateBounds."
                 ),
-                # Variation 1: balance resource utilization
+                # Variation 1: ASAP with delay-model tie-break
                 (
-                    "Implement a resource-balancing objective: iterate over graph_.nodes() "
-                    "and, for each non-dead non-untimed node, add a term to the objective "
-                    "that weights cycle_var_.at(node) by node->GetType()->GetFlatBitCount(). "
-                    "This penalizes scheduling wide (expensive) nodes late, naturally "
-                    "balancing resource usage across stages. This is a secondary objective "
-                    "after pipeline length has already been minimized, so optimize for lower "
-                    "register pressure / area at fixed stage count. Use kObjectiveScaling "
-                    "as an overall coefficient."
+                    "Implement an ASAP-first heuristic with delay-model tie-breaking. For "
+                    "each node in TopoSort order pick the earliest cycle in "
+                    "[bounds->lb(node), bounds->ub(node)]; among equally early cycles, "
+                    "prefer the one whose same-stage operands leave the most slack under "
+                    "clock_period_ps using delay_estimator.GetOperationDelayInPs(node). "
+                    "Always honour IsUntimed(node) and tighten bounds after each choice."
                 ),
-                # Variation 2: minimize register bits weighted by fan-out
+                # Variation 2: mobility-driven greedy
                 (
-                    "Revise the lifetime objective to weight register costs by the fan-out "
-                    "of each node. A node with many users kept alive across stage boundaries "
-                    "costs more in routing and area, so its lifetime penalty should be higher. "
-                    "Use node->users().size() as a multiplier on the lifetime_var coefficient."
+                    "Implement a mobility-aware greedy scheduler. For each node compute "
+                    "mobility = bounds->ub(node) - bounds->lb(node) and handle low-mobility "
+                    "(critical) nodes first — schedule them ASAP for timing. For "
+                    "high-mobility wide nodes (big GetFlatBitCount, many users), push them "
+                    "to cycles that reduce live-out bits. Use bounds->TightenNodeLb/Ub and "
+                    "bounds->PropagateBounds() after every assignment."
                 ),
-                # Variation 3: hierarchical objective
+                # Variation 3: lookahead over candidate cycles
                 (
-                    "Implement a hierarchical objective using the existing LP variables, but "
-                    "treat this as a tie-breaker objective at fixed pipeline length. "
-                    "(1) Primary within the fixed-length solve: minimize total register "
-                    "pressure by summing "
-                    "kObjectiveScaling * lifetime_var_.at(node) for all non-untimed nodes. "
-                    "(2) Secondary: add kObjectiveScaling * 1e-6 * cycle_var_.at(node) as "
-                    "an ASAP tie-breaker. Combine the terms into one LinearExpression and "
-                    "call model_.Minimize(). Do not rely on last_stage_ changing the "
-                    "minimum pipeline length in the default scheduling flow."
-                ),
-            ],
-            "delay_constraints": [
-                # Variation 0: slack-aware constraints
-                (
-                    "In ComputeCombinationalDelayConstraints, add a slack-proportional "
-                    "relaxation: instead of a strict > clock_period boundary, also generate "
-                    "constraints for node pairs whose critical path is within 10% of the "
-                    "clock period (near-critical paths). This pre-emptively prevents "
-                    "near-timing-violation paths from causing infeasibility."
-                ),
-                # Variation 1: transitive reduction
-                (
-                    "Implement a transitive reduction of the delay constraints: after computing "
-                    "the minimal constraint set, remove any constraint (a→b) that is already "
-                    "implied by a chain of other constraints. This reduces LP problem size "
-                    "and can speed up the solver while keeping the solution quality identical."
-                ),
-            ],
-            "lifetime_constraints": [
-                # Variation 0: fanout- and width-aware lifetime pressure
-                (
-                    "In AddLifetimeConstraint, preserve legality but increase the pressure on "
-                    "expensive long-lived values. Scale the lifetime pressure using both bit "
-                    "width and user fanout so wide values with many users are discouraged from "
-                    "staying live across stage boundaries."
-                ),
-                # Variation 1: sink-aware pressure for long-lived values
-                (
-                    "Revise AddLifetimeConstraint to penalize values that survive for many "
-                    "cycles or live all the way to the sink node. Keep the LP valid, but make "
-                    "farther user distances increasingly costly so the scheduler prefers "
-                    "placements with fewer live-out bits."
+                    "Implement a deterministic multistage heuristic with lightweight "
+                    "lookahead: for each node iterate candidate_cycle in "
+                    "[bounds->lb(node), bounds->ub(node)] and score not just this node's "
+                    "placement but the pressure it adds for its users (use node->users() "
+                    "and their assigned cycles). Pick the lowest-score cycle, record it in "
+                    "the ScheduleCycleMap, and propagate bounds."
                 ),
             ],
         }
 
-        variants = instructions.get(island.mutation_type, ["Improve this function's algorithm."])
+        variants = instructions.get(
+            island.mutation_type,
+            instructions["agent_scheduler"],
+        )
         return variants[iteration % len(variants)]

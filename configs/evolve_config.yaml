@@ -13,11 +13,18 @@ ai_model: "gpt-5.4"    # Model shown in codex TUI — accessible via education s
 max_tokens: 8192        # Max tokens for AI response
 
 # ── Mutation targets (which functions the AI evolves) ─────────────────────────
-# Available: 'sdc_objective', 'delay_constraints', 'min_cut', 'lifetime_constraints'
-# In single-island mode, keep this list to one target for the cleanest results.
+# Only one mutation target is supported: 'agent_scheduler'. The AI evolves
+# xls/scheduling/agent_generated_scheduler.cc — the standalone scheduler XLS
+# dispatches when --scheduling_strategy=agent.
 mutation_types:
-  - delay_constraints
-  # - lifetime_constraints
+  - agent_scheduler
+
+# ── PPA evaluation depth ──────────────────────────────────────────────────────
+# fast     : codegen_main only; parse block_metrics for stages + reg_bits
+# medium   : (future) Yosys synth; stat for gate + FF count
+# slow     : rebuild + run benchmark_main for asap7 area + critical path
+# slowest  : (future) Yosys synth_asap7 + OpenROAD place-and-route
+ppa_mode: "fast"
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 bazel_jobs: 8           # Parallel Bazel jobs (set to your core count)

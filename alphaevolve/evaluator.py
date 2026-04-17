@@ -4,9 +4,10 @@ alphaevolve/evaluator.py
 Orchestrates one full evaluation cycle for a candidate:
   backup → apply generated code → build → run XLS pipeline → extract PPA → restore on failure
 
-The Evaluator operates on a single MUTATION TARGET: one function in sdc_scheduler.cc.
-It splices the AI-generated function into the source file using a marker-based approach
-(locate the function by signature, replace its body), then diffs against the original.
+The Evaluator operates on a single MUTATION TARGET: AgentGeneratedScheduler()
+in xls/scheduling/agent_generated_scheduler.cc. It splices the AI-generated
+function into the source file using a marker-based approach (locate the
+function by signature, replace its body), then diffs against the original.
 """
 
 from __future__ import annotations
@@ -24,23 +25,12 @@ from xls_tools.pipeline import XLSPipeline, PipelineResult
 
 
 # ── Mutation target registry ───────────────────────────────────────────────────
+# Only one mutation target is supported: the agent-generated scheduler.
 # Maps short name → (file_relative_to_xls_src, function_signature_prefix)
 MUTATION_TARGETS: dict[str, tuple[str, str]] = {
-    "sdc_objective": (
-        "xls/scheduling/sdc_scheduler.cc",
-        "void SDCSchedulingModel::SetObjective(",
-    ),
-    "delay_constraints": (
-        "xls/scheduling/sdc_scheduler.cc",
-        "absl::flat_hash_map<Node*, std::vector<Node*>>\nComputeCombinationalDelayConstraints(",
-    ),
-    "min_cut": (
-        "xls/scheduling/min_cut_scheduler.cc",
-        "absl::StatusOr<ScheduleCycleMap> MinCutScheduler(",
-    ),
-    "lifetime_constraints": (
-        "xls/scheduling/sdc_scheduler.cc",
-        "absl::Status SDCSchedulingModel::AddLifetimeConstraint(",
+    "agent_scheduler": (
+        "xls/scheduling/agent_generated_scheduler.cc",
+        "absl::StatusOr<ScheduleCycleMap> AgentGeneratedScheduler(",
     ),
 }
 
@@ -65,6 +55,7 @@ class Evaluator:
         design_files: list[Path | str],
         ppa_constraints: dict,
         output_dir: Path | str,
+        ppa_mode: str = "fast",
     ):
         self.xls_src = Path(xls_src)
         self.builder = builder
@@ -73,6 +64,7 @@ class Evaluator:
         self.ppa_constraints = ppa_constraints
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.ppa_mode = ppa_mode
 
     def evaluate(
         self,
@@ -89,7 +81,6 @@ class Evaluator:
         target_file_rel, signature = MUTATION_TARGETS[mutation_type]
         target_file = self.xls_src / target_file_rel
         t_start = time.monotonic()
-        scheduling_strategy = self._scheduling_strategy_for(mutation_type)
 
         # ── Read original source ──────────────────────────────────────────────
         original_source = target_file.read_text(encoding="utf-8")
@@ -112,7 +103,9 @@ class Evaluator:
         self.builder.apply(target_file, new_source)
 
         # ── Build ─────────────────────────────────────────────────────────────
-        build_result = self.builder.build()
+        build_result = self.builder.build(
+            XLSBuilder.iteration_targets_for_mode(self.ppa_mode)
+        )
         if not build_result.success:
             self.builder.restore(target_file)
             return self._make_failed(
@@ -124,9 +117,7 @@ class Evaluator:
             )
 
         # ── Run XLS pipeline on all benchmark designs ─────────────────────────
-        aggregate_ppa = self._run_pipeline_on_designs(
-            iteration, island_id, scheduling_strategy
-        )
+        aggregate_ppa = self._run_pipeline_on_designs(iteration, island_id)
 
         # ── Restore original (we keep the best separately via diffs) ──────────
         self.builder.restore(target_file)
@@ -161,20 +152,19 @@ class Evaluator:
 
     def evaluate_baseline(self, mutation_type: str) -> EvalResult:
         """
-        Evaluate the UNMODIFIED sdc_scheduler.cc (no AI mutation) and return a
-        baseline Candidate with iteration=-1.  Called once before the evolution loop
-        to seed islands, so the AI always has a valid compilable parent to build on.
+        Evaluate the UNMODIFIED agent_generated_scheduler.cc (no AI mutation)
+        and return a baseline Candidate with iteration=-1.  Called once before
+        the evolution loop to seed islands so the AI always has a valid
+        compilable parent to build on.
         """
         target_file_rel, _ = MUTATION_TARGETS[mutation_type]
         target_file = self.xls_src / target_file_rel
         original_source = target_file.read_text(encoding="utf-8")
         t_start = time.monotonic()
-        scheduling_strategy = self._scheduling_strategy_for(mutation_type)
 
         aggregate_ppa = self._run_pipeline_on_designs(
             iteration=-1,
             island_id=-1,
-            scheduling_strategy=scheduling_strategy,
         )
 
         candidate = Candidate(
@@ -193,7 +183,7 @@ class Evaluator:
             ppa_score=aggregate_ppa.score,
             build_duration_s=0.0,
             total_duration_s=time.monotonic() - t_start,
-            notes="Baseline: original unmodified sdc_scheduler.cc",
+            notes=f"Baseline: original unmodified {target_file_rel}",
         )
         return EvalResult(candidate=candidate, ppa=aggregate_ppa)
 
@@ -201,12 +191,12 @@ class Evaluator:
         self,
         iteration: int,
         island_id: int,
-        scheduling_strategy: str,
     ) -> PPAMetrics:
 
         """
         Run the XLS pipeline on all benchmark designs and aggregate PPA.
-        Primary source: benchmark_main (area_um2, critical_path_ps, pipeline_flops)
+        The scheduling strategy is always ``agent``; the PPA source depends on
+        ``ppa_mode`` (fast: block_metrics only, slow: + benchmark_main).
         """
         total_stages = 0
         total_flops  = 0
@@ -224,7 +214,7 @@ class Evaluator:
                 pipeline_stages=self.ppa_constraints.get("pipeline_stages"),
                 delay_model=self.ppa_constraints.get("delay_model", "unit"),
                 generator=self.ppa_constraints.get("generator", "pipeline"),
-                scheduling_strategy=scheduling_strategy,
+                ppa_mode=self.ppa_mode,
             )
             if not result.success:
                 continue
@@ -259,10 +249,6 @@ class Evaluator:
         )
         agg._compute()
         return agg
-
-    @staticmethod
-    def _scheduling_strategy_for(mutation_type: str) -> str:
-        return "min_cut" if mutation_type == "min_cut" else "sdc"
 
     @staticmethod
     def _splice_function(source: str, signature: str, new_body: str) -> str | None:

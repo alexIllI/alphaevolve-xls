@@ -1,16 +1,39 @@
 {# Jinja2 template — rendered by sampler.py before each Codex CLI call #}
+{# Fallback template. The active target is always 'agent_scheduler', which uses #}
+{# implement_agent_scheduler.txt. This template mirrors that guidance in case #}
+{# the sampler falls back to it. #}
 == CURRENT TASK ==
-Implement a new version of the function `{{ mutation_target }}` in XLS's SDC scheduler (xls/scheduling/sdc_scheduler.cc).
+Implement a new version of the function `{{ mutation_target }}` in
+`{{ target_file_path }}`. The target is XLS's standalone agent-generated
+scheduler (`xls/scheduling/agent_generated_scheduler.cc`), dispatched when
+XLS is invoked with `--scheduling_strategy=agent`.
 
-== IMPORTANT SCHEDULER BEHAVIOR ==
-When XLS is not given a fixed pipeline length, SDCScheduler::Schedule() first minimizes
-pipeline length, then pins that minimum length, and only after that calls SetObjective().
-Implications:
-  - `SetObjective()` usually CANNOT reduce stage count in the default flow.
-  - `SetObjective()` mainly affects tie-breaking among minimum-stage schedules,
-    especially register pressure / lifetimes.
-  - `ComputeCombinationalDelayConstraints()` CAN affect feasibility and therefore
-    the minimum pipeline length.
+== REQUIRED SIGNATURE ==
+absl::StatusOr<ScheduleCycleMap> AgentGeneratedScheduler(
+    FunctionBase* f, int64_t pipeline_stages, int64_t clock_period_ps,
+    const DelayEstimator& delay_estimator, sched::ScheduleBounds* bounds,
+    absl::Span<const SchedulingConstraint> constraints);
+
+== WHAT THE FUNCTION MUST DO ==
+1. Walk nodes in topological order using `TopoSort(f)`.
+2. Skip any node where `IsUntimed(node)` is true.
+3. Read the feasible window `[bounds->lb(node), bounds->ub(node)]`.
+4. Choose a cycle inside that window using a principled heuristic
+   (timing / register pressure / mobility / lookahead).
+5. Record the choice in a `ScheduleCycleMap`
+   (`absl::flat_hash_map<Node*, int64_t>`).
+6. Pin the choice via `bounds->TightenNodeLb(node, cycle)` and
+   `bounds->TightenNodeUb(node, cycle)`.
+7. Call `bounds->PropagateBounds()` after each assignment.
+8. Return the completed map.
+
+== AVAILABLE APIS ==
+- TopoSort(f), IsUntimed(node)
+- bounds->lb(node) / bounds->ub(node)
+- bounds->TightenNodeLb(node, cycle), bounds->TightenNodeUb(node, cycle)
+- bounds->PropagateBounds()
+- delay_estimator.GetOperationDelayInPs(node)  →  absl::StatusOr<int64_t>
+- node->operands(), node->users(), node->GetType()->GetFlatBitCount()
 
 == CURRENT PPA SCORE ==
 Best score so far: {{ best_score }} (lower is better)
@@ -25,57 +48,43 @@ Parent candidate score: {{ parent_score }}
 == RELEVANT ALGORITHMS FROM LITERATURE ==
 {{ knowledge_context }}
 
-== CURRENT FUNCTION SOURCE (what you are replacing) ==
+== CURRENT SCHEDULER SOURCE (what you are replacing) ==
 {{ current_function_source }}
 
-== FULL sdc_scheduler.cc FOR CONTEXT ==
-Study this carefully for available types, member variables, and constants before writing code.
-{{ sdc_scheduler_source }}
+== REFERENCE XLS SOURCES ==
+{{ reference_source_bundle }}
 
 == STRICT OUTPUT RULES ==
-Your output will be spliced DIRECTLY into sdc_scheduler.cc at the exact location of the
-function above. The file already has:
+Your output is spliced DIRECTLY into `{{ target_file_path }}` at the location
+of the target function. The file already has:
   - `namespace xls {` at the top — do NOT add it again
-  - All necessary #includes — do NOT add includes
-  - Class definition for SDCSchedulingModel already visible
+  - All necessary `#include`s — do NOT add new ones
+  - Helper functions in an anonymous namespace that you may reuse
+    (`NodeBitCount`, `NodeFanout`, `EstimateBoundaryRegisterCost`,
+    `ScoreCandidateCycle`). You may also add your own helpers inside a new
+    anonymous namespace block above the target function.
 
 You MUST follow these rules or the code will not compile:
-
-1. DO NOT wrap your output in `namespace xls { }` or any other namespace.
-   Just write the function(s) directly, as they appear in the file.
-
-2. DO NOT redeclare the class or any members. Member variables (e.g. `model_`,
-   `cycle_var_`, `lifetime_var_`, `graph_`, `stage_var_`) are accessible directly
-   because the function is a method of SDCSchedulingModel. Use them without `this->`.
-
-3. Use only identifiers that appear in the sdc_scheduler.cc source above.
-   Fully-qualify any OR-Tools names, e.g.:
-     - `operations_research::math_opt::kInfinity`  (not bare `kInfinity`)
-     - `math_opt::LinearExpression`  (already aliased via `using` in the file)
-
-4. Helper functions: you may add private helper functions above the main function.
-   They must be placed inside an anonymous `namespace { }` block (NOT `namespace xls`).
-
-5. DO NOT output markdown fences (no ```cpp). Output raw C++ only.
-
-6. The function signature must be preserved exactly as shown above.
+1. Preserve the function signature exactly.
+2. Do NOT wrap your output in `namespace xls { ... }` — you are already inside it.
+3. Do NOT redeclare or redefine helper functions that already exist in the file.
+4. Use only identifiers that appear in the sources above.
+5. Do NOT output markdown fences (no ```cpp). Output raw C++ only.
 
 {% if compile_error %}
 == PREVIOUS ATTEMPT FAILED TO COMPILE ==
-Your last output produced the following compiler errors. Read them carefully and fix
-every issue before writing your new implementation.
-
 Compiler output:
 {{ compile_error }}
 
-Common causes and fixes:
-  - Bare `kInfinity` → use `operations_research::math_opt::kInfinity`
-  - `cycle_var_[node]` → use `cycle_var_.at(node)` (it is a flat_hash_map)
-  - `namespace xls { }` wrapper → DO NOT add it; the splice goes inside the existing namespace
-  - `model_` not found → DO NOT redeclare; it is a class member, access it directly
-  - Unknown type → check the full sdc_scheduler.cc source below for available identifiers
+Fix every compiler issue before writing the next version.
 
+Common causes:
+  - Extra `namespace xls { }` wrapper (remove it)
+  - Using a helper function that doesn't exist in the file
+  - Accessing `bounds->lb(...)` on a reference instead of the pointer
+  - Forgetting `XLS_RETURN_IF_ERROR(...)` around `bounds->Tighten*` / `PropagateBounds()`
 {% endif %}
+
 == YOUR OUTPUT ==
-Write the complete C++ implementation of `{{ mutation_target }}`. Start with any helper
-`namespace { }` block if needed, then the function definition itself. Nothing else.
+Write raw C++ only: any new helper `namespace { }` block first (optional),
+then the complete definition of `{{ mutation_target }}`.
