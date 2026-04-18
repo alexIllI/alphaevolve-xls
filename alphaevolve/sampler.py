@@ -54,7 +54,7 @@ class Sampler:
         mutation_instruction: str,
         current_source: str,
         reference_source_bundle: str,
-        best_score: float,
+        best_score: float | None,           # None = no successful run yet
         best_num_stages: int,
         best_reg_bits: int,
         best_delay_ps: int,
@@ -63,6 +63,7 @@ class Sampler:
         parent_reg_bits: int,
         parent_delay_ps: int,
         knowledge_keys: list[str] | None = None,
+        baseline_benchmark_context: str | None = None,  # from design/<name>_benchmark.txt
         compile_error: str | None = None,   # set on retry so AI can fix its mistake
         target_file_path: str = "",
     ) -> str:
@@ -82,7 +83,7 @@ class Sampler:
             current_source=current_source,
             sdc_scheduler_source=reference_source_bundle,
             reference_source_bundle=reference_source_bundle,
-            best_score=best_score,
+            best_score=best_score,          # None on first iteration
             best_num_stages=best_num_stages,
             best_reg_bits=best_reg_bits,
             best_delay_ps=best_delay_ps,
@@ -91,6 +92,7 @@ class Sampler:
             parent_reg_bits=parent_reg_bits,
             parent_delay_ps=parent_delay_ps,
             knowledge_context=knowledge_context,
+            baseline_benchmark_context=baseline_benchmark_context,
             compile_error=compile_error,    # None on first attempt
             target_file_path=target_file_path,
         )

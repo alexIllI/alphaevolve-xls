@@ -19,12 +19,29 @@ Think in AlphaEvolve-style terms:
 - prefer a coherent strategy such as pressure-aware list scheduling, mobility-aware
   placement, multi-pass refinement, or greedy schedule repair
 
-== CURRENT PPA SCORE ==
-Best score so far: {{ best_score }} (lower is better)
-  ↳ {{ best_num_stages }} pipeline stages, {{ best_reg_bits }} register bits, {{ best_delay_ps }}ps critical path
+Use all of your relevant prior knowledge as well:
+- the `knowledge/` excerpts are helpful context, not an exclusive whitelist
+- you may draw on general graph algorithms, scheduling theory, compiler heuristics,
+  optimization intuition, and standard hardware-scheduling ideas you already know
+- if the local knowledge is incomplete, still propose a principled algorithm based
+  on sound fundamentals rather than limiting yourself to only the quoted notes
 
+== CURRENT PPA SCORE ==
+{% if best_score is not none %}
+Best score so far: {{ best_score | int }} (lower is better)
+  ↳ {{ best_num_stages }} pipeline stages, {{ best_reg_bits }} register bits, {{ best_delay_ps }}ps critical path
+{% else %}
+Best score so far: none yet — you are the first iteration, aim to produce a valid schedule.
+{% endif %}
 Parent candidate score: {{ parent_score }}
   ↳ {{ parent_num_stages }} stages, {{ parent_reg_bits }} register bits, {{ parent_delay_ps }}ps
+
+{% if baseline_benchmark_context %}
+== BASELINE XLS BENCHMARK RESULTS ==
+These are benchmark_main results from the original XLS scheduler (not the agent).
+Use them as a reference to understand what PPA your algorithm should aim to beat.
+{{ baseline_benchmark_context }}
+{% endif %}
 
 == MUTATION INSTRUCTION ==
 {{ mutation_instruction }}
@@ -46,14 +63,29 @@ Your output will be spliced directly into `{{ target_file_path }}` at the exact
 location of the target function.
 
 You MUST follow these rules or the code will not compile:
-1. Preserve the function signature exactly.
-2. Do NOT add `#include` lines.
-3. Do NOT wrap the output in `namespace xls {}`.
+1. CRITICAL: Do NOT add `#include` lines.
+2. CRITICAL: Do NOT wrap the output in `namespace xls {}`.
+3. Preserve the function signature exactly.
 4. You may add helper functions before the main function, preferably in an
    anonymous `namespace {}` block.
 5. Use only identifiers and APIs visible in the current source and references.
 6. Prefer existing XLS utilities over inventing new infrastructure.
 7. Do not emit markdown fences or prose.
+
+Bad output examples that will fail immediately:
+- `#include "xls/..."`
+- `namespace xls {`
+- `````cpp`
+
+Why this is strict:
+- the output is inserted in the middle of an existing `.cc` file
+- the file already has the required includes
+- the file is already inside `namespace xls`
+
+Correct output shape:
+- optional anonymous `namespace {}` helpers
+- then the full `AgentGeneratedScheduler(...)` definition
+- raw C++ only
 
 Compile-safety guidance:
 - Keep the algorithm self-contained inside this file.

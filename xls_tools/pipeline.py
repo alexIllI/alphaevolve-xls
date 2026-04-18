@@ -97,12 +97,12 @@ class XLSPipeline:
             raise FileNotFoundError(f"Binary '{name}' not found")
         return p
 
-    def _run(self, cmd: list, **kwargs) -> subprocess.CompletedProcess:
+    def _run(self, cmd: list, timeout: int = 300, **kwargs) -> subprocess.CompletedProcess:
         return subprocess.run(
             [str(c) for c in cmd],
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=timeout,
             **kwargs,
         )
 
@@ -232,10 +232,17 @@ class XLSPipeline:
         # ── Stage 3: benchmark_main → primary PPA report ─────────────────────────
         benchmark_out = None
         bm_bin = self._bin("benchmark_main")
-        if run_benchmark_main and bm_bin:
+
+        # benchmark_main with asap7 delay model JIT-compiles a cell library and
+        # runs the scheduler — allow up to 30 minutes for complex designs.
+        _BENCHMARK_TIMEOUT = 1800
+
+        def _run_benchmark_main() -> BenchmarkOutput | None:
+            if bm_bin is None:
+                return None
+
             bm_cmd = [
                 bm_bin, str(opt_ir_path),
-                # No --top: auto-detected from package top set by ir_converter_main
                 f"--delay_model={delay_model}",
                 f"--area_model={area_model}",
                 f"--scheduling_strategy={scheduling_strategy}",
@@ -246,18 +253,26 @@ class XLSPipeline:
             if pipeline_stages is not None:
                 bm_cmd += [f"--pipeline_stages={pipeline_stages}"]
 
-            bm_result = self._run(bm_cmd)
+            try:
+                bm_result = self._run(bm_cmd, timeout=_BENCHMARK_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                msg = (
+                    f"benchmark_main timed out after {_BENCHMARK_TIMEOUT}s "
+                    f"(delay_model={delay_model}, design={opt_ir_path.stem})\n"
+                )
+                benchmark_log_path.write_text(msg, encoding="utf-8")
+                return None
+
             bm_text = bm_result.stdout + bm_result.stderr
             benchmark_log_path.write_text(bm_text, encoding="utf-8")
 
-            # Parse even on non-zero exit: benchmark_main for proc networks
-            # completes scheduling (prints Critical path, delay per stage) but
-            # then fails at internal block codegen lowering. The scheduling
-            # metrics are what we need, and they're printed before codegen.
             parsed = parse_benchmark_stdout(bm_text)
             if parsed.critical_path_ps > 0 or parsed.num_stages > 0 or "Pipeline:" in bm_text:
-                benchmark_out = parsed
-                benchmark_out.raw_stdout = bm_text
+                parsed.raw_stdout = bm_text
+                return parsed
+            return None
+        if run_benchmark_main and bm_bin:
+            benchmark_out = _run_benchmark_main()
         else:
             message = (
                 f"benchmark_main skipped (ppa_mode={ppa_mode})\n"
@@ -289,6 +304,8 @@ class XLSPipeline:
         # Proc networks (e.g. matmul_4x4) may fail codegen_main's register-reset
         # validation while benchmark_main handles them fine.
         codegen_ok = result.returncode == 0
+        if not codegen_ok and benchmark_out is None and bm_bin is not None:
+            benchmark_out = _run_benchmark_main()
         if not codegen_ok and benchmark_out is None:
             return _fail("codegen", result)   # no PPA at all → hard fail
 

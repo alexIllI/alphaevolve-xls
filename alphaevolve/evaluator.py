@@ -13,6 +13,7 @@ function by signature, replace its body), then diffs against the original.
 from __future__ import annotations
 
 import difflib
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -22,6 +23,9 @@ from alphaevolve.database import Candidate
 from alphaevolve.ppa_metrics import extract_ppa, PPAMetrics
 from xls_tools.build import XLSBuilder, BuildResult
 from xls_tools.pipeline import XLSPipeline, PipelineResult
+
+
+LOG = logging.getLogger(__name__)
 
 
 # ── Mutation target registry ───────────────────────────────────────────────────
@@ -86,7 +90,14 @@ class Evaluator:
         original_source = target_file.read_text(encoding="utf-8")
 
         # ── Splice generated code into source ─────────────────────────────────
-        new_source = self._splice_function(original_source, signature, generated_code)
+        sanitized_code, sanitization_notes = self._sanitize_generated_code(generated_code)
+        if sanitization_notes:
+            LOG.warning(
+                "Sanitized AI output for %s: %s",
+                mutation_type,
+                ", ".join(sanitization_notes),
+            )
+        new_source = self._splice_function(original_source, signature, sanitized_code)
         if new_source is None:
             return self._make_failed(
                 iteration, island_id, parent_id, mutation_type,
@@ -149,43 +160,6 @@ class Evaluator:
         )
 
     # ── Internal helpers ───────────────────────────────────────────────────────
-
-    def evaluate_baseline(self, mutation_type: str) -> EvalResult:
-        """
-        Evaluate the UNMODIFIED agent_generated_scheduler.cc (no AI mutation)
-        and return a baseline Candidate with iteration=-1.  Called once before
-        the evolution loop to seed islands so the AI always has a valid
-        compilable parent to build on.
-        """
-        target_file_rel, _ = MUTATION_TARGETS[mutation_type]
-        target_file = self.xls_src / target_file_rel
-        original_source = target_file.read_text(encoding="utf-8")
-        t_start = time.monotonic()
-
-        aggregate_ppa = self._run_pipeline_on_designs(
-            iteration=-1,
-            island_id=-1,
-        )
-
-        candidate = Candidate(
-            iteration=-1,
-            island_id=-1,
-            parent_id=None,
-            mutation_type=mutation_type,
-            target_file=target_file_rel,
-            source_diff="",
-            generated_code="(baseline — original XLS code)",
-            build_status="success" if aggregate_ppa.feasible else "run_failed",
-            num_stages=aggregate_ppa.num_stages,
-            pipeline_reg_bits=aggregate_ppa.pipeline_reg_bits,
-            max_stage_delay_ps=aggregate_ppa.critical_path_ps,
-            min_clock_period_ps=aggregate_ppa.min_clock_period_ps,
-            ppa_score=aggregate_ppa.score,
-            build_duration_s=0.0,
-            total_duration_s=time.monotonic() - t_start,
-            notes=f"Baseline: original unmodified {target_file_rel}",
-        )
-        return EvalResult(candidate=candidate, ppa=aggregate_ppa)
 
     def _run_pipeline_on_designs(
         self,
@@ -251,6 +225,58 @@ class Evaluator:
         )
         agg._compute()
         return agg
+
+    @staticmethod
+    def _sanitize_generated_code(generated_code: str) -> tuple[str, list[str]]:
+        text = generated_code.strip()
+        notes: list[str] = []
+
+        if text.startswith("```"):
+            opening = re.match(r"^```[a-zA-Z0-9_+-]*\s*\n", text)
+            if opening:
+                text = text[opening.end():]
+                notes.append("removed opening code fence")
+            if text.endswith("```"):
+                text = text[:-3]
+                notes.append("removed closing code fence")
+            text = text.strip()
+
+        lines = text.splitlines()
+        kept_lines: list[str] = []
+        stripping_prefix = True
+        removed_includes = False
+        for line in lines:
+            stripped = line.strip()
+            if stripping_prefix and (not stripped or stripped.startswith("#include ")):
+                if stripped.startswith("#include "):
+                    removed_includes = True
+                continue
+            stripping_prefix = False
+            kept_lines.append(line)
+        if removed_includes:
+            notes.append("removed leading includes")
+        text = "\n".join(kept_lines).strip()
+
+        namespace_match = re.match(r"^\s*namespace\s+xls\s*\{", text)
+        if namespace_match:
+            open_brace = text.find("{", namespace_match.start())
+            depth = 0
+            close_brace = -1
+            for i in range(open_brace, len(text)):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        close_brace = i
+                        break
+            if close_brace != -1:
+                trailer = text[close_brace + 1 :].strip()
+                if not trailer or trailer.startswith("//"):
+                    text = text[open_brace + 1 : close_brace].strip()
+                    notes.append("removed outer namespace xls wrapper")
+
+        return text.strip() + "\n", notes
 
     @staticmethod
     def _splice_function(source: str, signature: str, new_body: str) -> str | None:

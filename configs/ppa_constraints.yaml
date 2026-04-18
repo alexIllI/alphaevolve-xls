@@ -9,7 +9,14 @@
 #   wide multipliers / float FMA  →  1500–2000 ps
 # ─────────────────────────────────────────────────────────────────────────────
 
-# XLS delay model: 'unit' (abstract, fast), 'sky130', 'asap7' (technology-specific)
+# XLS delay model used for both codegen_main and benchmark_main.
+#   'unit'  — abstract 1-unit-per-op model. Fast. No JIT compilation.
+#             Critical path is in abstract units, not real picoseconds.
+#   'asap7' — ASAP7 7nm standard-cell library (JIT-compiled via LLVM on first use).
+#             Gives real picosecond delays and area. Slower, especially with --ppa_mode slow.
+#             benchmark_main with asap7 can take 5–30 min on complex designs.
+# Recommendation: use 'unit' during fast-mode iteration, switch to 'asap7' only
+# for final slow-mode runs where you need real timing/area numbers.
 delay_model: "asap7"
 
 # Force a fixed number of pipeline stages (null = let the scheduler decide).
