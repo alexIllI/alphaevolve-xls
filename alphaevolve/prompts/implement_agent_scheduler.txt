@@ -18,6 +18,13 @@ Think in AlphaEvolve-style terms:
 - reuse existing XLS bounds/constraint machinery rather than rebuilding all infrastructure
 - prefer a coherent strategy such as pressure-aware list scheduling, mobility-aware
   placement, multi-pass refinement, or greedy schedule repair
+- be innovative in the heuristic, but disciplined in implementation size and runtime
+- prefer one coherent algorithmic family over a giant hybrid of many unrelated ideas
+- do NOT fall back to trivial ASAP-only behavior unless that is clearly justified by
+  a stronger scoring/tie-breaking scheme
+- avoid bloated helper duplication, multiple abandoned scoring families, or heavy
+  nested search that is likely to time out on larger designs
+- bounded lookahead or one repair pass is good; unbounded multi-pass exploration is not
 
 Use all of your relevant prior knowledge as well:
 - the `knowledge/` excerpts are helpful context, not an exclusive whitelist
@@ -25,6 +32,11 @@ Use all of your relevant prior knowledge as well:
   optimization intuition, and standard hardware-scheduling ideas you already know
 - if the local knowledge is incomplete, still propose a principled algorithm based
   on sound fundamentals rather than limiting yourself to only the quoted notes
+
+Runtime expectations:
+- target a practical heuristic that can run on larger graphs such as GEMM-style designs
+- prefer roughly single-pass topological scheduling with bounded per-node candidate scoring
+- be careful with repeated expensive recomputation after every choice
 
 == CURRENT PPA SCORE ==
 {% if best_score is not none %}

@@ -1,0 +1,1135 @@
+diff --git a/xls/scheduling/BUILD b/xls/scheduling/BUILD
+index ade0d462a..99f7956b8 100644
+--- a/xls/scheduling/BUILD
++++ b/xls/scheduling/BUILD
+@@ -263,11 +263,30 @@ cc_library(
+     ],
+ )
+ 
++cc_library(
++    name = "agent_generated_scheduler",
++    srcs = ["agent_generated_scheduler.cc"],
++    hdrs = ["agent_generated_scheduler.h"],
++    deps = [
++        ":schedule_bounds",
++        ":schedule_graph",
++        ":scheduling_options",
++        "//xls/common/status:status_macros",
++        "//xls/estimators/delay_model:delay_estimator",
++        "//xls/ir",
++        "@com_google_absl//absl/container:flat_hash_map",
++        "@com_google_absl//absl/status",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/types:span",
++    ],
++)
++
+ cc_library(
+     name = "run_pipeline_schedule",
+     srcs = ["run_pipeline_schedule.cc"],
+     hdrs = ["run_pipeline_schedule.h"],
+     deps = [
++        ":agent_generated_scheduler",
+         ":min_cut_scheduler",
+         ":pipeline_schedule",
+         ":schedule_bounds",
+@@ -346,7 +365,6 @@ cc_test(
+     srcs = ["schedule_bounds_test.cc"],
+     deps = [
+         ":schedule_bounds",
+-        ":schedule_graph",
+         "//xls/common:xls_gunit_main",
+         "//xls/common/status:matchers",
+         "//xls/common/status:status_macros",
+diff --git a/xls/scheduling/agent_generated_scheduler.cc b/xls/scheduling/agent_generated_scheduler.cc
+new file mode 100644
+index 000000000..eae2f0c21
+--- /dev/null
++++ b/xls/scheduling/agent_generated_scheduler.cc
+@@ -0,0 +1,802 @@
++// Copyright 2026 The XLS Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "xls/scheduling/agent_generated_scheduler.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdlib>
++#include <limits>
++
++#include "absl/container/flat_hash_map.h"
++#include "absl/status/status.h"
++#include "absl/status/statusor.h"
++#include "absl/types/span.h"
++#include "xls/common/status/status_macros.h"
++#include "xls/estimators/delay_model/delay_estimator.h"
++#include "xls/ir/function_base.h"
++#include "xls/ir/node.h"
++#include "xls/ir/topo_sort.h"
++#include "xls/scheduling/schedule_bounds.h"
++#include "xls/scheduling/schedule_graph.h"
++#include "xls/scheduling/scheduling_options.h"
++
++namespace xls {
++namespace {
++
++int64_t NodeBitCount(Node* node) {
++  return node->GetType()->GetFlatBitCount();
++}
++
++int64_t NodeFanout(Node* node) {
++  return std::max<int64_t>(1, node->users().size());
++}
++
++int64_t EstimateBoundaryRegisterCost(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles) {
++  int64_t cost = 0;
++  for (Node* operand : node->operands()) {
++    auto it = assigned_cycles.find(operand);
++    if (it != assigned_cycles.end() && it->second < candidate_cycle) {
++      cost += NodeBitCount(operand);
++    }
++  }
++  for (Node* user : node->users()) {
++    auto it = assigned_cycles.find(user);
++    if (it != assigned_cycles.end() && candidate_cycle < it->second) {
++      cost += NodeBitCount(node);
++    }
++  }
++  return cost;
++}
++
++int64_t ScoreCandidateCycle(
++    Node* node, int64_t candidate_cycle, int64_t earliest_cycle,
++    int64_t latest_cycle, int64_t clock_period_ps, int64_t node_delay_ps,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    const absl::flat_hash_map<Node*, int64_t>& completion_time_ps,
++    const absl::flat_hash_map<int64_t, int64_t>& stage_node_count) {
++  int64_t start_time_ps = 0;
++  for (Node* operand : node->operands()) {
++    auto cycle_it = assigned_cycles.find(operand);
++    if (cycle_it != assigned_cycles.end() &&
++        cycle_it->second == candidate_cycle) {
++      auto time_it = completion_time_ps.find(operand);
++      if (time_it != completion_time_ps.end()) {
++        start_time_ps = std::max(start_time_ps, time_it->second);
++      }
++    }
++  }
++
++  const int64_t completion_ps = start_time_ps + node_delay_ps;
++  const int64_t timing_overflow_ps =
++      std::max<int64_t>(0, completion_ps - clock_period_ps);
++  const int64_t mobility_span =
++      std::max<int64_t>(1, latest_cycle - earliest_cycle + 1);
++  const int64_t stage_fill = stage_node_count.contains(candidate_cycle)
++                                 ? stage_node_count.at(candidate_cycle)
++                                 : 0;
++  const int64_t boundary_cost =
++      EstimateBoundaryRegisterCost(node, candidate_cycle, assigned_cycles);
++  const int64_t lateness_cost = candidate_cycle - earliest_cycle;
++  const int64_t criticality_cost =
++      NodeBitCount(node) * NodeFanout(node) * lateness_cost;
++
++  return timing_overflow_ps * timing_overflow_ps * 1000000LL +
++         boundary_cost * 64 + stage_fill * 32 +
++         (criticality_cost * 16) / mobility_span + lateness_cost;
++}
++
++}  // namespace
++
++namespace {
++
++int64_t GetNodeDelayPsOrZero(const DelayEstimator& delay_estimator, Node* node) {
++  absl::StatusOr<int64_t> delay_or = delay_estimator.GetOperationDelayInPs(node);
++  return delay_or.ok() ? delay_or.value() : 0;
++}
++
++bool IsTimedAssigned(
++    Node* node, const absl::flat_hash_map<Node*, int64_t>& assigned_cycles) {
++  return !IsUntimed(node) && assigned_cycles.contains(node);
++}
++
++int64_t AssignedCycleOrSelfLb(
++    Node* node, const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    sched::ScheduleBounds* bounds) {
++  if (IsUntimed(node)) {
++    return 0;
++  }
++  auto it = assigned_cycles.find(node);
++  if (it != assigned_cycles.end()) {
++    return it->second;
++  }
++  return bounds->lb(node);
++}
++
++int64_t EarliestSameStageStartTime(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    const absl::flat_hash_map<Node*, int64_t>& completion_time_ps) {
++  int64_t start_time_ps = 0;
++  for (Node* operand : node->operands()) {
++    auto cycle_it = assigned_cycles.find(operand);
++    if (cycle_it != assigned_cycles.end() &&
++        cycle_it->second == candidate_cycle) {
++      auto time_it = completion_time_ps.find(operand);
++      if (time_it != completion_time_ps.end()) {
++        start_time_ps = std::max(start_time_ps, time_it->second);
++      }
++    }
++  }
++  return start_time_ps;
++}
++
++int64_t EstimateFutureUsePressure(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    sched::ScheduleBounds* bounds) {
++  int64_t pressure = 0;
++  const int64_t node_bits = NodeBitCount(node);
++  for (Node* user : node->users()) {
++    if (IsUntimed(user)) {
++      continue;
++    }
++    auto it = assigned_cycles.find(user);
++    if (it != assigned_cycles.end()) {
++      if (it->second > candidate_cycle) {
++        pressure += node_bits * (it->second - candidate_cycle);
++      }
++      continue;
++    }
++    const int64_t projected_user_cycle = std::max(bounds->lb(user), candidate_cycle);
++    if (projected_user_cycle > candidate_cycle) {
++      pressure += node_bits * (projected_user_cycle - candidate_cycle);
++    }
++  }
++  return pressure;
++}
++
++int64_t EstimateOperandBoundaryCost(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles) {
++  int64_t cost = 0;
++  for (Node* operand : node->operands()) {
++    auto it = assigned_cycles.find(operand);
++    if (it != assigned_cycles.end() && it->second < candidate_cycle) {
++      cost += NodeBitCount(operand) * (candidate_cycle - it->second);
++    }
++  }
++  return cost;
++}
++
++int64_t EstimateConsumerPullCost(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    sched::ScheduleBounds* bounds) {
++  int64_t cost = 0;
++  const int64_t node_bits = NodeBitCount(node);
++  for (Node* user : node->users()) {
++    if (IsUntimed(user)) {
++      continue;
++    }
++    auto it = assigned_cycles.find(user);
++    if (it != assigned_cycles.end()) {
++      if (candidate_cycle < it->second) {
++        cost += node_bits * (it->second - candidate_cycle);
++      }
++      continue;
++    }
++    const int64_t user_lb = bounds->lb(user);
++    if (candidate_cycle < user_lb) {
++      cost += node_bits * (user_lb - candidate_cycle);
++    }
++  }
++  return cost;
++}
++
++int64_t ScorePlacement(
++    Node* node, int64_t candidate_cycle, int64_t lb, int64_t ub,
++    int64_t clock_period_ps, int64_t node_delay_ps,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    const absl::flat_hash_map<Node*, int64_t>& completion_time_ps,
++    const absl::flat_hash_map<int64_t, int64_t>& stage_node_count,
++    sched::ScheduleBounds* bounds) {
++  const int64_t mobility = std::max<int64_t>(0, ub - lb);
++  const int64_t same_stage_start = EarliestSameStageStartTime(
++      node, candidate_cycle, assigned_cycles, completion_time_ps);
++  const int64_t same_stage_end = same_stage_start + node_delay_ps;
++  const int64_t timing_overflow =
++      std::max<int64_t>(0, same_stage_end - clock_period_ps);
++
++  const int64_t operand_boundary_cost =
++      EstimateOperandBoundaryCost(node, candidate_cycle, assigned_cycles);
++  const int64_t consumer_pull_cost =
++      EstimateConsumerPullCost(node, candidate_cycle, assigned_cycles, bounds);
++  const int64_t future_use_pressure =
++      EstimateFutureUsePressure(node, candidate_cycle, assigned_cycles, bounds);
++
++  const int64_t stage_fill =
++      stage_node_count.contains(candidate_cycle)
++          ? stage_node_count.at(candidate_cycle)
++          : 0;
++
++  int64_t predecessor_slack_penalty = 0;
++  for (Node* operand : node->operands()) {
++    if (IsUntimed(operand)) {
++      continue;
++    }
++    auto it = assigned_cycles.find(operand);
++    if (it != assigned_cycles.end() && it->second > candidate_cycle) {
++      predecessor_slack_penalty += 1000000000LL;
++    }
++  }
++
++  const int64_t late_bias = candidate_cycle - lb;
++  const int64_t center_bias = std::abs(candidate_cycle - ((lb + ub) / 2));
++
++  return timing_overflow * timing_overflow * 1000000000LL +
++         predecessor_slack_penalty +
++         operand_boundary_cost * 1024 +
++         consumer_pull_cost * 2048 +
++         future_use_pressure * 64 +
++         stage_fill * 32 +
++         late_bias * (mobility == 0 ? 256 : 8) +
++         center_bias;
++}
++
++}  // namespace
++
++namespace {
++
++int64_t AgentAbsDiff(int64_t a, int64_t b) {
++  return a > b ? a - b : b - a;
++}
++
++int64_t AgentNodeDelayPsOrZero(const DelayEstimator& delay_estimator,
++                               Node* node) {
++  absl::StatusOr<int64_t> delay_or = delay_estimator.GetOperationDelayInPs(node);
++  return delay_or.ok() ? delay_or.value() : 0;
++}
++
++int64_t AgentSameStageStartTime(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    const absl::flat_hash_map<Node*, int64_t>& completion_time_ps) {
++  int64_t start_time_ps = 0;
++  for (Node* operand : node->operands()) {
++    if (IsUntimed(operand)) {
++      continue;
++    }
++    auto cycle_it = assigned_cycles.find(operand);
++    if (cycle_it == assigned_cycles.end() || cycle_it->second != candidate_cycle) {
++      continue;
++    }
++    auto time_it = completion_time_ps.find(operand);
++    if (time_it != completion_time_ps.end()) {
++      start_time_ps = std::max(start_time_ps, time_it->second);
++    }
++  }
++  return start_time_ps;
++}
++
++int64_t AgentOperandRegisterCost(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles) {
++  int64_t cost = 0;
++  for (Node* operand : node->operands()) {
++    if (IsUntimed(operand)) {
++      continue;
++    }
++    auto it = assigned_cycles.find(operand);
++    if (it == assigned_cycles.end()) {
++      continue;
++    }
++    if (it->second < candidate_cycle) {
++      cost += NodeBitCount(operand) * (candidate_cycle - it->second);
++    }
++  }
++  return cost;
++}
++
++int64_t AgentProjectedValueLifetimeCost(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    sched::ScheduleBounds* bounds) {
++  int64_t cost = 0;
++  const int64_t node_bits = NodeBitCount(node);
++  for (Node* user : node->users()) {
++    if (IsUntimed(user)) {
++      continue;
++    }
++    auto it = assigned_cycles.find(user);
++    if (it != assigned_cycles.end()) {
++      if (it->second > candidate_cycle) {
++        cost += node_bits * (it->second - candidate_cycle);
++      }
++      continue;
++    }
++    const int64_t projected_user_cycle = std::max(bounds->lb(user), candidate_cycle);
++    if (projected_user_cycle > candidate_cycle) {
++      cost += node_bits * (projected_user_cycle - candidate_cycle);
++    }
++  }
++  return cost;
++}
++
++int64_t AgentForcedUserDelayCost(Node* node, int64_t candidate_cycle,
++                                 sched::ScheduleBounds* bounds) {
++  int64_t cost = 0;
++  for (Node* user : node->users()) {
++    if (IsUntimed(user)) {
++      continue;
++    }
++    const int64_t user_lb = bounds->lb(user);
++    if (candidate_cycle > user_lb) {
++      const int64_t forced_late = candidate_cycle - user_lb;
++      cost += forced_late *
++              (NodeBitCount(node) + NodeBitCount(user) * NodeFanout(user));
++    }
++  }
++  return cost;
++}
++
++int64_t AgentStageFillCost(
++    int64_t cycle,
++    const absl::flat_hash_map<int64_t, int64_t>& stage_node_count) {
++  auto it = stage_node_count.find(cycle);
++  return it == stage_node_count.end() ? 0 : it->second;
++}
++
++int64_t AgentScoreCycle(
++    Node* node, int64_t candidate_cycle, int64_t lb, int64_t ub,
++    int64_t clock_period_ps, int64_t node_delay_ps,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    const absl::flat_hash_map<Node*, int64_t>& completion_time_ps,
++    const absl::flat_hash_map<int64_t, int64_t>& stage_node_count,
++    sched::ScheduleBounds* bounds) {
++  const int64_t same_stage_start =
++      AgentSameStageStartTime(node, candidate_cycle, assigned_cycles,
++                              completion_time_ps);
++  const int64_t same_stage_end = same_stage_start + node_delay_ps;
++  const int64_t timing_overflow =
++      std::max<int64_t>(0, same_stage_end - clock_period_ps);
++
++  const int64_t operand_cost =
++      AgentOperandRegisterCost(node, candidate_cycle, assigned_cycles);
++  const int64_t value_lifetime_cost =
++      AgentProjectedValueLifetimeCost(node, candidate_cycle, assigned_cycles,
++                                      bounds);
++  const int64_t forced_user_delay_cost =
++      AgentForcedUserDelayCost(node, candidate_cycle, bounds);
++  const int64_t stage_fill_cost =
++      AgentStageFillCost(candidate_cycle, stage_node_count);
++
++  const int64_t mobility = std::max<int64_t>(0, ub - lb);
++  const int64_t late_bias = candidate_cycle - lb;
++  const int64_t center_bias = AgentAbsDiff(candidate_cycle, (lb + ub) / 2);
++  const int64_t fanout = NodeFanout(node);
++  const int64_t critical_bias =
++      (late_bias * std::max<int64_t>(1, NodeBitCount(node) / 8) * fanout) /
++      std::max<int64_t>(1, mobility + 1);
++
++  return timing_overflow * timing_overflow * 1000000000LL +
++         operand_cost * 4096LL +
++         value_lifetime_cost * 2048LL +
++         forced_user_delay_cost * 8192LL +
++         stage_fill_cost * 64LL +
++         critical_bias * 32LL +
++         center_bias;
++}
++
++}  // namespace
++
++namespace {
++
++int64_t AgentSchedAbs(int64_t x) { return x < 0 ? -x : x; }
++
++int64_t AgentSchedDelayPsOrZero(const DelayEstimator& delay_estimator,
++                                Node* node) {
++  absl::StatusOr<int64_t> delay_or = delay_estimator.GetOperationDelayInPs(node);
++  return delay_or.ok() ? delay_or.value() : 0;
++}
++
++int64_t AgentSchedSameCycleStartTime(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    const absl::flat_hash_map<Node*, int64_t>& completion_time_ps) {
++  int64_t start_time_ps = 0;
++  for (Node* operand : node->operands()) {
++    if (IsUntimed(operand)) {
++      continue;
++    }
++    auto cycle_it = assigned_cycles.find(operand);
++    if (cycle_it == assigned_cycles.end() || cycle_it->second != candidate_cycle) {
++      continue;
++    }
++    auto time_it = completion_time_ps.find(operand);
++    if (time_it != completion_time_ps.end()) {
++      start_time_ps = std::max(start_time_ps, time_it->second);
++    }
++  }
++  return start_time_ps;
++}
++
++int64_t AgentSchedOperandBoundaryCost(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles) {
++  int64_t cost = 0;
++  for (Node* operand : node->operands()) {
++    if (IsUntimed(operand)) {
++      continue;
++    }
++    auto it = assigned_cycles.find(operand);
++    if (it == assigned_cycles.end()) {
++      continue;
++    }
++    if (it->second < candidate_cycle) {
++      cost += NodeBitCount(operand) * (candidate_cycle - it->second);
++    }
++  }
++  return cost;
++}
++
++int64_t AgentSchedAssignedUserCost(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles) {
++  int64_t cost = 0;
++  const int64_t node_bits = NodeBitCount(node);
++  for (Node* user : node->users()) {
++    if (IsUntimed(user)) {
++      continue;
++    }
++    auto it = assigned_cycles.find(user);
++    if (it == assigned_cycles.end()) {
++      continue;
++    }
++    if (candidate_cycle < it->second) {
++      cost += node_bits * (it->second - candidate_cycle);
++    }
++  }
++  return cost;
++}
++
++int64_t AgentSchedForcedLaterUserCost(Node* node, int64_t candidate_cycle,
++                                      sched::ScheduleBounds* bounds) {
++  int64_t cost = 0;
++  const int64_t node_bits = NodeBitCount(node);
++  for (Node* user : node->users()) {
++    if (IsUntimed(user)) {
++      continue;
++    }
++    const int64_t user_lb = bounds->lb(user);
++    if (candidate_cycle > user_lb) {
++      const int64_t delta = candidate_cycle - user_lb;
++      const int64_t mobility = std::max<int64_t>(0, bounds->ub(user) - user_lb);
++      const int64_t urgency = std::max<int64_t>(1, NodeFanout(user));
++      cost += delta * node_bits * urgency / std::max<int64_t>(1, mobility + 1);
++      cost += delta * std::max<int64_t>(1, NodeBitCount(user) / 8);
++    }
++  }
++  return cost;
++}
++
++int64_t AgentSchedStageDensityCost(
++    int64_t candidate_cycle,
++    const absl::flat_hash_map<int64_t, int64_t>& stage_node_count) {
++  auto it = stage_node_count.find(candidate_cycle);
++  return it == stage_node_count.end() ? 0 : it->second;
++}
++
++int64_t AgentSchedCriticalityBias(Node* node, int64_t candidate_cycle,
++                                  int64_t lb, int64_t ub) {
++  const int64_t slack = std::max<int64_t>(0, ub - lb);
++  const int64_t lateness = candidate_cycle - lb;
++  const int64_t midpoint = (lb + ub) / 2;
++  const int64_t center_dist = AgentSchedAbs(candidate_cycle - midpoint);
++  const int64_t urgency =
++      std::max<int64_t>(1, NodeFanout(node) + NodeBitCount(node) / 16);
++  return (lateness * urgency * 8) / std::max<int64_t>(1, slack + 1) + center_dist;
++}
++
++int64_t AgentSchedScoreCandidate(
++    Node* node, int64_t candidate_cycle, int64_t lb, int64_t ub,
++    int64_t clock_period_ps, int64_t node_delay_ps,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    const absl::flat_hash_map<Node*, int64_t>& completion_time_ps,
++    const absl::flat_hash_map<int64_t, int64_t>& stage_node_count,
++    sched::ScheduleBounds* bounds) {
++  const int64_t start_time_ps = AgentSchedSameCycleStartTime(
++      node, candidate_cycle, assigned_cycles, completion_time_ps);
++  const int64_t end_time_ps = start_time_ps + node_delay_ps;
++  const int64_t timing_overflow_ps =
++      std::max<int64_t>(0, end_time_ps - clock_period_ps);
++
++  const int64_t operand_boundary_cost =
++      AgentSchedOperandBoundaryCost(node, candidate_cycle, assigned_cycles);
++  const int64_t assigned_user_cost =
++      AgentSchedAssignedUserCost(node, candidate_cycle, assigned_cycles);
++  const int64_t forced_later_user_cost =
++      AgentSchedForcedLaterUserCost(node, candidate_cycle, bounds);
++  const int64_t stage_density_cost =
++      AgentSchedStageDensityCost(candidate_cycle, stage_node_count);
++  const int64_t criticality_bias =
++      AgentSchedCriticalityBias(node, candidate_cycle, lb, ub);
++
++  return timing_overflow_ps * timing_overflow_ps * 1000000000LL +
++         operand_boundary_cost * 4096LL +
++         assigned_user_cost * 2048LL +
++         forced_later_user_cost * 8192LL +
++         stage_density_cost * 32LL + criticality_bias;
++}
++
++}  // namespace
++
++namespace {
++
++int64_t AgentListAbs(int64_t x) { return x < 0 ? -x : x; }
++
++int64_t AgentListNodeDelayPsOrZero(const DelayEstimator& delay_estimator,
++                                   Node* node) {
++  absl::StatusOr<int64_t> delay_or = delay_estimator.GetOperationDelayInPs(node);
++  return delay_or.ok() ? delay_or.value() : 0;
++}
++
++int64_t AgentListSameStageStartTime(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    const absl::flat_hash_map<Node*, int64_t>& completion_time_ps) {
++  int64_t start_time_ps = 0;
++  for (Node* operand : node->operands()) {
++    if (IsUntimed(operand)) {
++      continue;
++    }
++    auto cycle_it = assigned_cycles.find(operand);
++    if (cycle_it == assigned_cycles.end() || cycle_it->second != candidate_cycle) {
++      continue;
++    }
++    auto time_it = completion_time_ps.find(operand);
++    if (time_it != completion_time_ps.end()) {
++      start_time_ps = std::max(start_time_ps, time_it->second);
++    }
++  }
++  return start_time_ps;
++}
++
++int64_t AgentListOperandBoundaryCost(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles) {
++  int64_t cost = 0;
++  for (Node* operand : node->operands()) {
++    if (IsUntimed(operand)) {
++      continue;
++    }
++    auto it = assigned_cycles.find(operand);
++    if (it == assigned_cycles.end()) {
++      continue;
++    }
++    if (it->second < candidate_cycle) {
++      cost += NodeBitCount(operand) * (candidate_cycle - it->second);
++    }
++  }
++  return cost;
++}
++
++int64_t AgentListProjectedUserBoundaryCost(
++    Node* node, int64_t candidate_cycle,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    sched::ScheduleBounds* bounds) {
++  int64_t cost = 0;
++  const int64_t node_bits = NodeBitCount(node);
++  for (Node* user : node->users()) {
++    if (IsUntimed(user)) {
++      continue;
++    }
++    auto it = assigned_cycles.find(user);
++    if (it != assigned_cycles.end()) {
++      if (candidate_cycle < it->second) {
++        cost += node_bits * (it->second - candidate_cycle);
++      }
++      continue;
++    }
++    const int64_t user_lb = bounds->lb(user);
++    if (candidate_cycle < user_lb) {
++      cost += node_bits * (user_lb - candidate_cycle);
++    }
++  }
++  return cost;
++}
++
++int64_t AgentListForcedLaterUserCost(Node* node, int64_t candidate_cycle,
++                                     sched::ScheduleBounds* bounds) {
++  int64_t cost = 0;
++  const int64_t node_bits = NodeBitCount(node);
++  for (Node* user : node->users()) {
++    if (IsUntimed(user)) {
++      continue;
++    }
++    const int64_t user_lb = bounds->lb(user);
++    const int64_t user_ub = bounds->ub(user);
++    if (candidate_cycle > user_lb) {
++      const int64_t delta = candidate_cycle - user_lb;
++      const int64_t mobility = std::max<int64_t>(0, user_ub - user_lb);
++      cost += delta * node_bits * std::max<int64_t>(1, NodeFanout(user));
++      cost += (delta * std::max<int64_t>(1, NodeBitCount(user))) /
++              std::max<int64_t>(1, mobility + 1);
++    }
++  }
++  return cost;
++}
++
++int64_t AgentListSuccessorUrgency(Node* node, sched::ScheduleBounds* bounds) {
++  int64_t urgency = 0;
++  for (Node* user : node->users()) {
++    if (IsUntimed(user)) {
++      continue;
++    }
++    const int64_t mobility = std::max<int64_t>(0, bounds->ub(user) - bounds->lb(user));
++    urgency += std::max<int64_t>(1, NodeFanout(user)) *
++               std::max<int64_t>(1, NodeBitCount(user) / 8 + 1) /
++               std::max<int64_t>(1, mobility + 1);
++  }
++  return std::max<int64_t>(1, urgency);
++}
++
++int64_t AgentListStageDensityCost(
++    int64_t cycle,
++    const absl::flat_hash_map<int64_t, int64_t>& stage_node_count) {
++  auto it = stage_node_count.find(cycle);
++  return it == stage_node_count.end() ? 0 : it->second;
++}
++
++int64_t AgentListScoreCandidate(
++    Node* node, int64_t candidate_cycle, int64_t lb, int64_t ub,
++    int64_t clock_period_ps, int64_t node_delay_ps,
++    const absl::flat_hash_map<Node*, int64_t>& assigned_cycles,
++    const absl::flat_hash_map<Node*, int64_t>& completion_time_ps,
++    const absl::flat_hash_map<int64_t, int64_t>& stage_node_count,
++    sched::ScheduleBounds* bounds) {
++  const int64_t start_time_ps = AgentListSameStageStartTime(
++      node, candidate_cycle, assigned_cycles, completion_time_ps);
++  const int64_t end_time_ps = start_time_ps + node_delay_ps;
++  const int64_t timing_overflow_ps =
++      std::max<int64_t>(0, end_time_ps - clock_period_ps);
++
++  const int64_t operand_boundary_cost =
++      AgentListOperandBoundaryCost(node, candidate_cycle, assigned_cycles);
++  const int64_t projected_user_boundary_cost =
++      AgentListProjectedUserBoundaryCost(node, candidate_cycle, assigned_cycles,
++                                         bounds);
++  const int64_t forced_later_user_cost =
++      AgentListForcedLaterUserCost(node, candidate_cycle, bounds);
++  const int64_t stage_density_cost =
++      AgentListStageDensityCost(candidate_cycle, stage_node_count);
++
++  const int64_t mobility = std::max<int64_t>(0, ub - lb);
++  const int64_t lateness = candidate_cycle - lb;
++  const int64_t midpoint = (lb + ub) / 2;
++  const int64_t center_bias = AgentListAbs(candidate_cycle - midpoint);
++  const int64_t criticality =
++      std::max<int64_t>(1, NodeBitCount(node) / 8 + NodeFanout(node));
++  const int64_t successor_urgency = AgentListSuccessorUrgency(node, bounds);
++
++  return timing_overflow_ps * timing_overflow_ps * 1000000000LL +
++         operand_boundary_cost * 8192LL +
++         projected_user_boundary_cost * 4096LL +
++         forced_later_user_cost * 16384LL +
++         stage_density_cost * 32LL +
++         (lateness * criticality * successor_urgency * 8LL) /
++             std::max<int64_t>(1, mobility + 1) +
++         center_bias;
++}
++
++}  // namespace
++
++absl::StatusOr<ScheduleCycleMap> AgentGeneratedScheduler(
++    FunctionBase* f, int64_t pipeline_stages, int64_t clock_period_ps,
++    const DelayEstimator& delay_estimator, sched::ScheduleBounds* bounds,
++    absl::Span<const SchedulingConstraint> constraints) {
++  if (std::getenv("XLS_AGENT_DRY_RUN") != nullptr) {
++    XLS_RETURN_IF_ERROR(bounds->PropagateBounds());
++    ScheduleCycleMap stub_map;
++    for (Node* node : TopoSort(f)) {
++      if (!IsUntimed(node)) {
++        stub_map[node] = bounds->lb(node);
++      }
++    }
++    return stub_map;
++  }
++
++  (void)pipeline_stages;
++  (void)constraints;
++
++  XLS_RETURN_IF_ERROR(bounds->PropagateBounds());
++
++  ScheduleCycleMap cycle_map;
++  absl::flat_hash_map<Node*, int64_t> assigned_cycles;
++  absl::flat_hash_map<Node*, int64_t> completion_time_ps;
++  absl::flat_hash_map<int64_t, int64_t> stage_node_count;
++
++  for (Node* node : TopoSort(f)) {
++    if (IsUntimed(node)) {
++      continue;
++    }
++
++    const int64_t lb = bounds->lb(node);
++    const int64_t ub = bounds->ub(node);
++    const int64_t node_delay_ps =
++        AgentListNodeDelayPsOrZero(delay_estimator, node);
++
++    int64_t best_cycle = lb;
++    int64_t best_score = std::numeric_limits<int64_t>::max();
++
++    for (int64_t candidate_cycle = lb; candidate_cycle <= ub; ++candidate_cycle) {
++      bool legal = true;
++      for (Node* operand : node->operands()) {
++        if (IsUntimed(operand)) {
++          continue;
++        }
++        auto it = assigned_cycles.find(operand);
++        if (it != assigned_cycles.end() && it->second > candidate_cycle) {
++          legal = false;
++          break;
++        }
++      }
++      if (!legal) {
++        continue;
++      }
++
++      const int64_t score = AgentListScoreCandidate(
++          node, candidate_cycle, lb, ub, clock_period_ps, node_delay_ps,
++          assigned_cycles, completion_time_ps, stage_node_count, bounds);
++
++      if (score < best_score ||
++          (score == best_score &&
++           AgentListAbs(candidate_cycle - ((lb + ub) / 2)) <
++               AgentListAbs(best_cycle - ((lb + ub) / 2))) ||
++          (score == best_score &&
++           AgentListAbs(candidate_cycle - ((lb + ub) / 2)) ==
++               AgentListAbs(best_cycle - ((lb + ub) / 2)) &&
++           candidate_cycle < best_cycle)) {
++        best_score = score;
++        best_cycle = candidate_cycle;
++      }
++    }
++
++    cycle_map[node] = best_cycle;
++    assigned_cycles[node] = best_cycle;
++    stage_node_count[best_cycle] += 1;
++    completion_time_ps[node] =
++        AgentListSameStageStartTime(node, best_cycle, assigned_cycles,
++                                    completion_time_ps) +
++        node_delay_ps;
++
++    XLS_RETURN_IF_ERROR(bounds->TightenNodeLb(node, best_cycle));
++    XLS_RETURN_IF_ERROR(bounds->TightenNodeUb(node, best_cycle));
++    XLS_RETURN_IF_ERROR(bounds->PropagateBounds());
++  }
++
++  return cycle_map;
++}
++
++
++
++
++
++
++
++
++
++}  // namespace xls
+diff --git a/xls/scheduling/agent_generated_scheduler.h b/xls/scheduling/agent_generated_scheduler.h
+new file mode 100644
+index 000000000..7fb3eaf05
+--- /dev/null
++++ b/xls/scheduling/agent_generated_scheduler.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 The XLS Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef XLS_SCHEDULING_AGENT_GENERATED_SCHEDULER_H_
++#define XLS_SCHEDULING_AGENT_GENERATED_SCHEDULER_H_
++
++#include <cstdint>
++
++#include "absl/status/statusor.h"
++#include "absl/types/span.h"
++#include "xls/estimators/delay_model/delay_estimator.h"
++#include "xls/ir/function_base.h"
++#include "xls/scheduling/schedule_bounds.h"
++#include "xls/scheduling/scheduling_options.h"
++
++namespace xls {
++
++absl::StatusOr<ScheduleCycleMap> AgentGeneratedScheduler(
++    FunctionBase* f, int64_t pipeline_stages, int64_t clock_period_ps,
++    const DelayEstimator& delay_estimator, sched::ScheduleBounds* bounds,
++    absl::Span<const SchedulingConstraint> constraints);
++
++}  // namespace xls
++
++#endif  // XLS_SCHEDULING_AGENT_GENERATED_SCHEDULER_H_
+diff --git a/xls/scheduling/run_pipeline_schedule.cc b/xls/scheduling/run_pipeline_schedule.cc
+index 717578715..f18fb2126 100644
+--- a/xls/scheduling/run_pipeline_schedule.cc
++++ b/xls/scheduling/run_pipeline_schedule.cc
+@@ -37,6 +37,7 @@
+ #include "absl/status/statusor.h"
+ #include "absl/strings/str_cat.h"
+ #include "absl/strings/str_format.h"
++#include "absl/strings/str_join.h"
+ #include "absl/types/span.h"
+ #include "xls/common/logging/log_lines.h"
+ #include "xls/common/math_util.h"
+@@ -60,6 +61,7 @@
+ #include "xls/ir/proc_elaboration.h"
+ #include "xls/ir/topo_sort.h"
+ #include "xls/scheduling/min_cut_scheduler.h"
++#include "xls/scheduling/agent_generated_scheduler.h"
+ #include "xls/scheduling/pipeline_schedule.h"
+ #include "xls/scheduling/schedule_bounds.h"
+ #include "xls/scheduling/schedule_graph.h"
+@@ -150,8 +152,7 @@ absl::StatusOr<int64_t> ComputeCriticalPath(
+     FunctionBase* f, const DelayEstimator& delay_estimator) {
+   XLS_ASSIGN_OR_RETURN(absl::flat_hash_set<Node*> dead_after_synthesis,
+                        GetDeadAfterSynthesisNodes(f));
+-  XLS_ASSIGN_OR_RETURN(std::vector<Node*> topo_sort_nodes, TopoSort(f));
+-  return ComputeCriticalPath(topo_sort_nodes, dead_after_synthesis,
++  return ComputeCriticalPath(TopoSort(f), dead_after_synthesis,
+                              delay_estimator);
+ }
+ 
+@@ -344,13 +345,12 @@ absl::Status GenerateHelpfulAsapError(absl::Status&& orig_status,
+   if (options.pipeline_stages().has_value()) {
+     XLS_ASSIGN_OR_RETURN(absl::flat_hash_set<xls::Node*> dead_after_synthesis,
+                          GetDeadAfterSynthesisNodes(f));
+-    XLS_ASSIGN_OR_RETURN(ScheduleGraph graph,
+-                         ScheduleGraph::Create(f, dead_after_synthesis));
+     XLS_ASSIGN_OR_RETURN(
+         auto bounds,
+-        sched::ScheduleBounds::Create(graph, clock_period_ps, delay_estimator,
+-                                      f->GetInitiationInterval().value_or(1),
+-                                      options.constraints()),
++        sched::ScheduleBounds::Create(
++            ScheduleGraph::Create(f, dead_after_synthesis), clock_period_ps,
++            delay_estimator, f->GetInitiationInterval().value_or(1),
++            options.constraints()),
+         std::move(status)
+             << "(Failed to create schedule bounds for error message creation)");
+     // Add first and last stage constraints.
+@@ -460,15 +460,13 @@ absl::StatusOr<PipelineSchedule> RunPipelineScheduleInternal(
+     // No scheduling to be done, and there's no way to violate timing; just
+     // schedule everything (other than literals) in the first cycle.
+     ScheduleCycleMap cycle_map;
+-    XLS_ASSIGN_OR_RETURN(std::vector<Node*> topo_sort_nodes, TopoSort(f));
+-    for (Node* node : topo_sort_nodes) {
++    for (Node* node : TopoSort(f)) {
+       if (!IsUntimed(node)) {
+         cycle_map[node] = 0;
+       }
+     }
+-    XLS_ASSIGN_OR_RETURN(PipelineSchedule schedule,
+-                         PipelineSchedule::Create(f, std::move(cycle_map),
+-                                                  options.pipeline_stages()));
++    PipelineSchedule schedule =
++        PipelineSchedule(f, std::move(cycle_map), options.pipeline_stages());
+     XLS_RETURN_IF_ERROR(schedule.Verify());
+     XLS_RETURN_IF_ERROR(schedule.VerifyConstraints(options.constraints(),
+                                                    f->GetInitiationInterval()));
+@@ -604,8 +602,7 @@ absl::StatusOr<PipelineSchedule> RunPipelineScheduleInternal(
+       isdc_options.path_evaluate_strategy =
+           options.fdo_path_evaluate_strategy();
+ 
+-      XLS_ASSIGN_OR_RETURN(DelayManager delay_manager,
+-                           DelayManager::Create(f, delay_estimator));
++      DelayManager delay_manager(f, delay_estimator);
+       XLS_ASSIGN_OR_RETURN(
+           cycle_map,
+           ScheduleByIterativeSDC(f, options.pipeline_stages(), clock_period_ps,
+@@ -613,9 +610,7 @@ absl::StatusOr<PipelineSchedule> RunPipelineScheduleInternal(
+                                  isdc_options, options.failure_behavior()));
+ 
+       // Use delay manager for scheduling timing verification.
+-      XLS_ASSIGN_OR_RETURN(
+-          PipelineSchedule schedule,
+-          PipelineSchedule::Create(f, cycle_map, options.pipeline_stages()));
++      auto schedule = PipelineSchedule(f, cycle_map, options.pipeline_stages());
+       XLS_RETURN_IF_ERROR(schedule.Verify());
+       XLS_RETURN_IF_ERROR(
+           schedule.VerifyTiming(clock_period_ps, delay_manager));
+@@ -724,13 +719,12 @@ absl::StatusOr<PipelineSchedule> RunPipelineScheduleInternal(
+     // First get the basic bounds.
+     XLS_ASSIGN_OR_RETURN(absl::flat_hash_set<Node*> dead_after_synthesis,
+                          GetDeadAfterSynthesisNodes(f));
+-    XLS_ASSIGN_OR_RETURN(ScheduleGraph graph,
+-                         ScheduleGraph::Create(f, dead_after_synthesis));
+     XLS_ASSIGN_OR_RETURN(
+         auto bounds,
+-        sched::ScheduleBounds::Create(graph, clock_period_ps, io_delay_added,
+-                                      f->GetInitiationInterval().value_or(1),
+-                                      options.constraints()));
++        sched::ScheduleBounds::Create(
++            ScheduleGraph::Create(f, dead_after_synthesis), clock_period_ps,
++            io_delay_added, f->GetInitiationInterval().value_or(1),
++            options.constraints()));
+     // Add first and last stage constraints.
+     using LastStageConstraint =
+         sched::ScheduleBounds::NodeSchedulingConstraint::LastStageConstraint;
+@@ -754,12 +748,18 @@ absl::StatusOr<PipelineSchedule> RunPipelineScheduleInternal(
+               f,
+               options.pipeline_stages().value_or(bounds.max_lower_bound() + 1),
+               clock_period_ps, io_delay_added, &bounds, options.constraints()));
++    } else if (options.strategy() == SchedulingStrategy::AGENT) {
++      XLS_ASSIGN_OR_RETURN(
++          cycle_map,
++          AgentGeneratedScheduler(
++              f,
++              options.pipeline_stages().value_or(bounds.max_lower_bound() + 1),
++              clock_period_ps, io_delay_added, &bounds, options.constraints()));
+     } else if (options.strategy() == SchedulingStrategy::RANDOM) {
+       std::mt19937_64 gen(options.seed().value_or(0));
+ 
+       cycle_map = ScheduleCycleMap();
+-      XLS_ASSIGN_OR_RETURN(std::vector<Node*> topo_sort_nodes, TopoSort(f));
+-      for (Node* node : topo_sort_nodes) {
++      for (Node* node : TopoSort(f)) {
+         if (IsUntimed(node)) {
+           continue;
+         }
+@@ -789,10 +789,8 @@ absl::StatusOr<PipelineSchedule> RunPipelineScheduleInternal(
+     }
+   }
+ 
+-  XLS_ASSIGN_OR_RETURN(
+-      PipelineSchedule schedule,
+-      PipelineSchedule::Create(f, cycle_map, options.pipeline_stages(),
+-                               min_clock_period_ps_for_tracing));
++  auto schedule = PipelineSchedule(f, cycle_map, options.pipeline_stages(),
++                                   min_clock_period_ps_for_tracing);
+   XLS_RETURN_IF_ERROR(schedule.Verify());
+   XLS_RETURN_IF_ERROR(schedule.VerifyTiming(clock_period_ps, io_delay_added));
+   XLS_RETURN_IF_ERROR(schedule.VerifyConstraints(options.constraints(),
+@@ -909,8 +907,8 @@ absl::StatusOr<PackageSchedule> RunSynchronousPipelineSchedule(
+       }
+       proc_cycle_map[node] = cycle_map.at(node) - synchronous_offsets.at(proc);
+     }
+-    XLS_ASSIGN_OR_RETURN(schedule_map[proc],
+-                         PipelineSchedule::Create(proc, proc_cycle_map));
++    PipelineSchedule schedule(proc, proc_cycle_map);
++    schedule_map[proc] = PipelineSchedule(proc, proc_cycle_map);
+   }
+ 
+   PackageSchedule package_schedule(package, std::move(schedule_map),
+diff --git a/xls/scheduling/scheduling_options.cc b/xls/scheduling/scheduling_options.cc
+index b20b26bc9..5088e3d9e 100644
+--- a/xls/scheduling/scheduling_options.cc
++++ b/xls/scheduling/scheduling_options.cc
+@@ -51,6 +51,8 @@ ProtoSchedulingStrategy ToProtoSchedulingStrategy(SchedulingStrategy strategy) {
+       return ProtoSchedulingStrategy::SCHEDULER_TYPE_SDC;
+     case SchedulingStrategy::RANDOM:
+       return ProtoSchedulingStrategy::SCHEDULER_TYPE_RANDOM;
++    case SchedulingStrategy::AGENT:
++      return ProtoSchedulingStrategy::SCHEDULER_TYPE_AGENT;
+   }
+ }
+ SchedulingStrategy FromProtoSchedulingStrategy(
+@@ -65,6 +67,8 @@ SchedulingStrategy FromProtoSchedulingStrategy(
+       return SchedulingStrategy::SDC;
+     case ProtoSchedulingStrategy::SCHEDULER_TYPE_RANDOM:
+       return SchedulingStrategy::RANDOM;
++    case ProtoSchedulingStrategy::SCHEDULER_TYPE_AGENT:
++      return SchedulingStrategy::AGENT;
+     default:
+       LOG(FATAL) << "Unknown scheduling strategy: " << strategy;
+   }
+@@ -85,6 +89,8 @@ bool AbslParseFlag(std::string_view text, SchedulingStrategy* strategy,
+     *strategy = SchedulingStrategy::SDC;
+   } else if (str_text == "random") {
+     *strategy = SchedulingStrategy::RANDOM;
++  } else if (str_text == "agent") {
++    *strategy = SchedulingStrategy::AGENT;
+   } else {
+     *error = absl::StrCat("Unknown scheduling strategy: ", text);
+     return false;
+@@ -102,6 +108,8 @@ std::string AbslUnparseFlag(const SchedulingStrategy& strategy) {
+       return "sdc";
+     case SchedulingStrategy::RANDOM:
+       return "random";
++    case SchedulingStrategy::AGENT:
++      return "agent";
+   }
+ }
+ 
+diff --git a/xls/scheduling/scheduling_options.h b/xls/scheduling/scheduling_options.h
+index 62c019c57..2b86b4d47 100644
+--- a/xls/scheduling/scheduling_options.h
++++ b/xls/scheduling/scheduling_options.h
+@@ -60,6 +60,9 @@ enum class SchedulingStrategy : int8_t {
+ 
+   // Create a random but sound schedule. This is useful for testing.
+   RANDOM,
++
++  // A standalone heuristic scheduler intended for rapid algorithm iteration.
++  AGENT,
+ };
+ 
+ ProtoSchedulingStrategy ToProtoSchedulingStrategy(SchedulingStrategy strategy);
+diff --git a/xls/tools/scheduling_options_flags.cc b/xls/tools/scheduling_options_flags.cc
+index 6b88cf07c..7613f81a8 100644
+--- a/xls/tools/scheduling_options_flags.cc
++++ b/xls/tools/scheduling_options_flags.cc
+@@ -86,7 +86,7 @@ ABSL_FLAG(xls::SchedulingStrategy, scheduling_strategy,
+           xls::SchedulingStrategy::SDC,
+           "Scheduler algorithm to use.\n"
+           "\n"
+-          "Options: [sdc, asap, min_cut, random]\n"
++          "Options: [sdc, asap, min_cut, random, agent]\n"
+           "\n"
+           "Standard Scheduler:\n"
+           "sdc: Default. Constraint based scheduling to minimize registers.\n"
+@@ -101,7 +101,9 @@ ABSL_FLAG(xls::SchedulingStrategy, scheduling_strategy,
+           "min-cut based algorithm.\n"
+           "         Does not respect io_constraints.\n"
+           "random: Randomly schedules nodes. For internal testing only.\n"
+-          "        Does not respect io_constraints.");
++          "        Does not respect io_constraints.\n"
++          "agent: Standalone heuristic scheduler for rapid algorithm "
++          "iteration.\n");
+ ABSL_FLAG(int64_t, clock_margin_percent, 0,
+           "The percentage of clock period to set aside as a margin to ensure "
+           "timing is met. Effectively, this lowers the clock period by this "
+diff --git a/xls/tools/scheduling_options_flags.proto b/xls/tools/scheduling_options_flags.proto
+index 0ddc88944..d4a352934 100644
+--- a/xls/tools/scheduling_options_flags.proto
++++ b/xls/tools/scheduling_options_flags.proto
+@@ -48,6 +48,8 @@ enum ProtoSchedulingStrategy {
+   SCHEDULER_TYPE_MIN_CUT = 3;
+   // A scheduler which randomly schedules nodes. For internal testing only.
+   SCHEDULER_TYPE_RANDOM = 4;
++  // A standalone heuristic scheduler intended for rapid algorithm iteration.
++  SCHEDULER_TYPE_AGENT = 5;
+ }
+ 
+ message SchedulingFailureBehaviorProto {

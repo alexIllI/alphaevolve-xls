@@ -73,6 +73,9 @@ alphaevolve-xls/
 ├── knowledge/
 │   ├── papers/                     Scheduling theory summaries injected into prompts
 │   └── heuristics/                 ASAP/ALAP, list scheduling references
+├── xls_patch/
+│   ├── xls_agent_scheduler.patch   Git diff of all XLS changes (for reference / review)
+│   └── files/                      Verbatim copies of every modified XLS file
 └── results/                        Per-run outputs (gitignored)
 ```
 
@@ -82,41 +85,30 @@ alphaevolve-xls/
 
 ## Prerequisites
 
-Google XLS cloned and buildable from source. The project assumes `/mnt/d/final/xls` but any path works as long as `--xls_src` or `$XLS_SRC_PATH` points at it.
-
-A Linux environment. WSL2 Ubuntu 22.04 is the tested setup.
-
-Python 3.11 or newer, in a virtualenv.
-
-Either an OpenAI API key (for `--backend openai`) or Codex CLI v0.120 installed (for `--backend codex`).
+- A Linux environment (WSL2 Ubuntu 22.04 is the tested setup)
+- Python 3.11 or newer
+- Either an OpenAI API key (`--backend openai`) or Codex CLI v0.120 (`--backend codex`)
+- Bazel (for building XLS from source — required for the evolution loop)
 
 ---
 
 ## Setup
 
+### 1. Clone the repos
+
+This project uses a fork of Google XLS that includes the `AgentGeneratedScheduler` extension. Clone the fork — **not** the original `google/xls`.
+
 ```bash
-# 1. Clone alongside XLS
 cd /mnt/d/final
+git clone https://github.com/alexIllI/xls.git
 git clone https://github.com/alexIllI/alphaevolve-xls.git
-cd alphaevolve-xls
-
-# 2. Python env
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# 3. Env file (optional; needed for --backend openai)
-cp .env.example .env
-# edit .env and set OPENAI_API_KEY=...
 ```
 
----
+### 2. Build XLS from source (one-time, 2–6 hours)
 
-## Build XLS from Source (one-time)
+The evolution loop recompiles the scheduler on every iteration via incremental Bazel builds, so XLS must be built from source first. After the initial build, each iteration only relinks a small set of targets (~10–30 s).
 
-The evolution loop needs to be able to recompile the scheduler on every iteration, which means XLS must be built from source first. Plan on a 2–6 hour first build; after that every iteration is a small incremental rebuild.
-
-**Minimum build (works with `--ppa_mode fast` on function-type designs):**
+**Minimum build** (works with `--ppa_mode fast` on function-type designs):
 
 ```bash
 cd /mnt/d/final/xls
@@ -127,13 +119,29 @@ bazel build -c opt \
   //xls/dslx/ir_convert:ir_converter_main
 ```
 
-**Add `benchmark_main` for `--ppa_mode slow` or proc designs (mac, matmul):**
+**Add `benchmark_main`** for `--ppa_mode slow` or proc-type designs (mac, matmul):
 
 ```bash
 bazel build -c opt //xls/dev_tools:benchmark_main
 ```
 
-> `benchmark_main` pulls in LLVM/JIT and is the largest target. With `--ppa_mode fast` on function-type designs (fir32, dot_product, gemm, idct, sha256, bitonic_sort, crc32), it is not needed. For proc-type designs or when you need ASAP7 area estimates, build it once and use `--ppa_mode slow`.
+> `benchmark_main` pulls in LLVM/JIT and is the largest target. For function-type designs (fir32, dot_product, gemm, idct, sha256, bitonic_sort, crc32) in `--ppa_mode fast` it is not needed. Build it once and use `--ppa_mode slow` when you need ASAP7 area/timing estimates or are running proc-type designs.
+
+### 3. Python environment
+
+```bash
+cd /mnt/d/final/alphaevolve-xls
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 4. API key (optional — only for `--backend openai`)
+
+```bash
+cp .env.example .env
+# edit .env and set OPENAI_API_KEY=sk-...
+```
 
 ---
 

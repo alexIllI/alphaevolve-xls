@@ -97,7 +97,7 @@ class XLSPipeline:
             raise FileNotFoundError(f"Binary '{name}' not found")
         return p
 
-    def _run(self, cmd: list, timeout: int = 300, **kwargs) -> subprocess.CompletedProcess:
+    def _run(self, cmd: list, timeout: int = 1800, **kwargs) -> subprocess.CompletedProcess:
         return subprocess.run(
             [str(c) for c in cmd],
             capture_output=True,
@@ -282,11 +282,34 @@ class XLSPipeline:
             benchmark_log_path.write_text(message, encoding="utf-8")
 
         # ── Stage 4: codegen_main → Verilog + block_metrics ─────────────────────
+        # In slow mode, benchmark_main is the primary PPA source. If it already
+        # produced valid metrics, skip codegen entirely — we don't need Verilog or
+        # block_metrics for scoring, and codegen can time out on complex AI-generated
+        # schedulers (the AI-generated scheduler runs inside codegen too).
+        if benchmark_out is not None and run_benchmark_main:
+            return PipelineResult(
+                success=True,
+                verilog_path=None,
+                schedule_path=None,
+                block_metrics_path=None,
+                benchmark_output=benchmark_out,
+                ir_path=ir_path,
+                top_function=top,
+                stdout="",
+                stderr="codegen_main skipped — benchmark_main PPA already available",
+            )
+
+        # codegen_main runs the delay estimator inline on every node during
+        # scheduling — always use 'unit' here regardless of the configured
+        # delay_model. asap7 / sky130 are JIT-compiled and make codegen_main
+        # orders-of-magnitude slower on complex designs (>30 min for gemm4x4_int).
+        # The real delay/area numbers come from benchmark_main (slow mode only),
+        # which is designed to tolerate the full asap7 model.
         codegen_cmd = [
             self._require_bin("codegen_main"), str(opt_ir_path),
             # No --top: auto-detected from package top set by ir_converter_main
             f"--generator={generator}",
-            f"--delay_model={delay_model}",
+            "--delay_model=unit",
             f"--output_verilog_path={verilog_path}",
         ]
         if generator == "pipeline":

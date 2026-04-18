@@ -113,28 +113,39 @@ class Evaluator:
         self.builder.backup(target_file)
         self.builder.apply(target_file, new_source)
 
-        # ── Build ─────────────────────────────────────────────────────────────
-        build_result = self.builder.build(
-            XLSBuilder.iteration_targets_for_mode(self.ppa_mode)
-        )
-        if not build_result.success:
+        build_result: BuildResult | None = None
+        aggregate_ppa = PPAMetrics(feasible=False)
+        error_msg = ""
+
+        try:
+            # ── Build ─────────────────────────────────────────────────────────
+            build_result = self.builder.build(
+                XLSBuilder.iteration_targets_for_mode(self.ppa_mode)
+            )
+            if not build_result.success:
+                error_msg = (
+                    f"Bazel build failed in {build_result.duration_seconds:.1f}s:\n"
+                    f"{build_result.stderr[-2000:]}"
+                )
+            else:
+                # ── Run XLS pipeline on all benchmark designs ─────────────────
+                aggregate_ppa, error_msg = self._run_pipeline_on_designs(
+                    iteration, island_id
+                )
+        finally:
+            # Always restore — even if build or pipeline throws (e.g. TimeoutExpired)
             self.builder.restore(target_file)
+            self.builder.cleanup_backups()
+
+        total_duration = time.monotonic() - t_start
+
+        if build_result is not None and not build_result.success:
             return self._make_failed(
                 iteration, island_id, parent_id, mutation_type,
                 target_file_rel, generated_code, diff,
-                "build_failed",
-                f"Bazel build failed in {build_result.duration_seconds:.1f}s:\n{build_result.stderr[-2000:]}",
+                "build_failed", error_msg,
                 t_start, build_result=build_result,
             )
-
-        # ── Run XLS pipeline on all benchmark designs ─────────────────────────
-        aggregate_ppa = self._run_pipeline_on_designs(iteration, island_id)
-
-        # ── Restore original (we keep the best separately via diffs) ──────────
-        self.builder.restore(target_file)
-        self.builder.cleanup_backups()
-
-        total_duration = time.monotonic() - t_start
 
         candidate = Candidate(
             iteration=iteration,
@@ -150,8 +161,9 @@ class Evaluator:
             max_stage_delay_ps=aggregate_ppa.critical_path_ps,
             min_clock_period_ps=aggregate_ppa.min_clock_period_ps,
             ppa_score=aggregate_ppa.score,
-            build_duration_s=build_result.duration_seconds,
+            build_duration_s=build_result.duration_seconds if build_result else 0.0,
             total_duration_s=total_duration,
+            notes=error_msg,
         )
         return EvalResult(
             candidate=candidate,
@@ -165,33 +177,52 @@ class Evaluator:
         self,
         iteration: int,
         island_id: int,
-    ) -> PPAMetrics:
-
+    ) -> tuple[PPAMetrics, str]:
         """
         Run the XLS pipeline on all benchmark designs and aggregate PPA.
-        The scheduling strategy is always ``agent``; the PPA source depends on
-        ``ppa_mode`` (fast: block_metrics only, slow: + benchmark_main).
+
+        Returns (PPAMetrics, error_message). PPAMetrics.feasible=False when no
+        design produced valid PPA (run_failed). error_message is non-empty when
+        a pipeline stage timed out or all designs failed.
+
+        Subprocess timeouts (e.g. AI-generated scheduler stuck in infinite loop)
+        are caught here and converted into run_failed instead of crashing the run.
         """
+        import subprocess as _sp
+
         total_stages = 0
         total_flops  = 0
         total_area   = 0.0
         max_delay    = 0
         max_min_clock = 0
         any_feasible = False
+        timeout_errors: list[str] = []
 
         per_design_overrides = self.ppa_constraints.get("per_design", {})
         for design in self.design_files:
             cstr = {**self.ppa_constraints, **per_design_overrides.get(design.stem, {})}
             run_dir = self.output_dir / f"iter{iteration:04d}_island{island_id}" / design.stem
-            result = self.pipeline.run(
-                dslx_file=design,
-                output_dir=run_dir,
-                clock_period_ps=cstr.get("clock_period_ps", 1000),
-                pipeline_stages=cstr.get("pipeline_stages"),
-                delay_model=cstr.get("delay_model", "unit"),
-                generator=cstr.get("generator", "pipeline"),
-                ppa_mode=self.ppa_mode,
-            )
+            try:
+                result = self.pipeline.run(
+                    dslx_file=design,
+                    output_dir=run_dir,
+                    clock_period_ps=cstr.get("clock_period_ps", 1000),
+                    pipeline_stages=cstr.get("pipeline_stages"),
+                    delay_model=cstr.get("delay_model", "unit"),
+                    generator=cstr.get("generator", "pipeline"),
+                    ppa_mode=self.ppa_mode,
+                )
+            except _sp.TimeoutExpired as exc:
+                # AI-generated scheduler hung (infinite loop / excessive complexity).
+                # Treat as run_failed for this design; continue to next design.
+                msg = (
+                    f"{design.stem}: pipeline stage timed out "
+                    f"({exc.timeout:.0f}s) — scheduler likely too slow"
+                )
+                LOG.warning(msg)
+                timeout_errors.append(msg)
+                continue
+
             if not result.success:
                 continue
 
@@ -199,7 +230,7 @@ class Evaluator:
                 schedule_path=result.schedule_path,
                 verilog_path=result.verilog_path,
                 block_metrics_path=result.block_metrics_path,
-                benchmark_output=result.benchmark_output,   # ← primary PPA source
+                benchmark_output=result.benchmark_output,
             )
             if not ppa.feasible:
                 continue
@@ -212,7 +243,8 @@ class Evaluator:
             max_min_clock = max(max_min_clock, ppa.min_clock_period_ps)
 
         if not any_feasible:
-            return PPAMetrics(feasible=False)
+            err = "; ".join(timeout_errors) if timeout_errors else "no design met constraints"
+            return PPAMetrics(feasible=False), err
 
         agg = PPAMetrics(
             num_stages=total_stages,
@@ -224,7 +256,7 @@ class Evaluator:
             feasible=True,
         )
         agg._compute()
-        return agg
+        return agg, ""
 
     @staticmethod
     def _sanitize_generated_code(generated_code: str) -> tuple[str, list[str]]:

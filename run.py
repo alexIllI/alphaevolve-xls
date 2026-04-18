@@ -274,6 +274,21 @@ def main() -> int:
         dslx_stdlib_path=xls_src / "xls" / "dslx" / "stdlib",  # for float32 etc.
     )
 
+    # ── Check for leftover .bak (previous run crashed before restore) ────────
+    from alphaevolve.evaluator import MUTATION_TARGETS
+    for _mt, (_rel, _) in MUTATION_TARGETS.items():
+        _target_file = xls_src / _rel
+        _bak_file = _target_file.with_suffix(_target_file.suffix + ".bak")
+        if _bak_file.exists():
+            console.print(
+                f"[bold yellow]⚠ WARNING:[/] Found leftover backup: {_bak_file.name}\n"
+                f"  A previous run crashed before restoring the original source.\n"
+                f"  Auto-restoring from backup now..."
+            )
+            _target_file.write_text(_bak_file.read_text(encoding="utf-8"), encoding="utf-8")
+            _bak_file.unlink()
+            console.print(f"  [green]✓[/] Restored {_target_file.name} from backup.")
+
     # benchmark_main is only needed for ppa_mode in ("slow", "slowest").
     needs_benchmark_main = ppa_mode in ("slow", "slowest")
 

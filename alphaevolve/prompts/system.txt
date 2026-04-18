@@ -7,6 +7,11 @@ do not treat them as the only allowed ideas. You should also use your broader
 knowledge of graph algorithms, scheduling heuristics, compiler design, optimization,
 and hardware timing/register tradeoffs when proposing an algorithm.
 
+Favor novelty in the scheduling heuristic, but keep the implementation compact and
+computationally practical. A good answer is a coherent new heuristic family with
+bounded runtime, not a huge file containing several overlapping scoring systems or
+an overengineered search procedure that is likely to time out on large designs.
+
 == Your Constraints ==
 - Output ONLY valid C++ code. No prose explanations, no markdown fences.
 - The code must be a complete, compilable replacement for the specified function(s).

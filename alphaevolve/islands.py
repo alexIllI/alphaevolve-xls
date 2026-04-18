@@ -130,11 +130,91 @@ class IslandManager:
             if not any(c.id == best.id for c in island.population):
                 island.add(best)
 
+    # ── Bootstrap instructions (iterations 0, 1, 2) ───────────────────────────
+    # These three are intentionally maximally diverse so that the first few
+    # design points on a PPA graph cover very different regions of the
+    # area/delay/stages trade-off space before evolution starts mixing them.
+    # Each targets a completely different algorithmic family.
+    _BOOTSTRAP_INSTRUCTIONS: dict[str, list[str]] = {
+        "agent_scheduler": [
+            # Bootstrap 0: Pure ALAP — schedule every node as LATE as possible.
+            # Opposite extreme from ASAP. Values are computed at the last legal
+            # cycle, which pushes register pressure toward the back of the
+            # pipeline and tends to produce fewer stages than register-aware
+            # heuristics but with a very different register distribution.
+            (
+                "Implement a pure ALAP (As-Late-As-Possible) scheduler. "
+                "For every timed node in TopoSort(f) order, assign it to "
+                "bounds->ub(node) — the latest legal cycle — without any "
+                "further scoring or tie-breaking. Call "
+                "bounds->TightenNodeLb(node, cycle), "
+                "bounds->TightenNodeUb(node, cycle), and "
+                "bounds->PropagateBounds() after each assignment. "
+                "The goal is to produce a baseline that is the furthest "
+                "possible from ASAP scheduling, deferring every computation "
+                "to the last permissible moment. Keep the implementation "
+                "short and direct — no helper scoring functions needed."
+            ),
+            # Bootstrap 1: Stage-load balancing — equalize node count per stage.
+            # Neither ASAP nor ALAP: instead track how many nodes have been placed
+            # in each stage and steer each new node toward the most under-loaded
+            # valid stage. This produces a flat histogram across stages, minimising
+            # peak combinational complexity and giving a distinct area profile.
+            (
+                "Implement a stage-load-balancing scheduler. "
+                "Maintain a per-stage node count array of size pipeline_stages. "
+                "For each timed node in TopoSort(f) order, examine every "
+                "candidate cycle c in [bounds->lb(node), bounds->ub(node)] "
+                "and choose the c with the smallest current node count "
+                "(tie-break: prefer earlier cycle). Increment the count for "
+                "the chosen stage, record the assignment, call "
+                "bounds->TightenNodeLb/Ub(node, c) and "
+                "bounds->PropagateBounds(). "
+                "The objective is a flat, balanced stage histogram — minimising "
+                "the max-stage node count — which yields a distinct "
+                "combinational-depth profile compared to ASAP or ALAP."
+            ),
+            # Bootstrap 2: Critical-path ALAP then ASAP fill.
+            # Two-pass approach: identify nodes on the critical path (zero
+            # mobility: ub==lb) and schedule them ASAP for timing closure.
+            # All other nodes are pushed ALAP to reduce unnecessary register
+            # pressure. This produces a distinct 'tight-critical-path' profile.
+            (
+                "Implement a two-pass critical-path-first scheduler. "
+                "Pass 1 — schedule CRITICAL nodes (bounds->ub(node) == "
+                "bounds->lb(node), i.e. zero mobility) first, assigning each "
+                "to bounds->lb(node) and propagating bounds immediately. "
+                "Pass 2 — schedule all remaining timed nodes in TopoSort(f) "
+                "order, assigning each to bounds->ub(node) (ALAP) so that "
+                "non-critical operations are deferred as late as possible. "
+                "After every assignment call bounds->TightenNodeLb/Ub and "
+                "bounds->PropagateBounds(). "
+                "This two-pass strategy keeps the critical path tight while "
+                "minimising register pressure for non-critical values."
+            ),
+        ],
+    }
+
     def mutation_instruction_for(self, island: Island, iteration: int) -> str:
         """
-        Returns a mutation instruction string for the AI, varying by island
-        and iteration to encourage exploration of different algorithmic ideas.
+        Returns a mutation instruction string for the AI.
+
+        Iterations 0, 1, 2 always use the bootstrap instructions — three
+        maximally-diverse algorithmic families (ALAP, stage-balanced,
+        critical-path-first) designed to seed distinct PPA design points.
+
+        From iteration 3 onwards the normal per-island variant rotation
+        takes over, encouraging exploration around whatever the bootstrap
+        runs discovered.
         """
+        bootstrap = self._BOOTSTRAP_INSTRUCTIONS.get(
+            island.mutation_type,
+            self._BOOTSTRAP_INSTRUCTIONS["agent_scheduler"],
+        )
+        if iteration < len(bootstrap):
+            return bootstrap[iteration]
+
+        # Normal rotation for iteration >= 3
         # Mutation target: AgentGeneratedScheduler() in
         # xls/scheduling/agent_generated_scheduler.cc.
         # Available APIs the variants can lean on:
@@ -143,7 +223,7 @@ class IslandManager:
         #   bounds->TightenNodeLb/Ub(node, cycle), bounds->PropagateBounds()
         #   delay_estimator.GetOperationDelayInPs(node)
         #   node->operands(), node->users(), node->GetType()->GetFlatBitCount()
-        instructions = {
+        variants = {
             "agent_scheduler": [
                 # Variation 0: register-pressure-aware list scheduler
                 (
@@ -185,8 +265,6 @@ class IslandManager:
             ],
         }
 
-        variants = instructions.get(
-            island.mutation_type,
-            instructions["agent_scheduler"],
-        )
-        return variants[iteration % len(variants)]
+        v = variants.get(island.mutation_type, variants["agent_scheduler"])
+        # Offset by len(bootstrap) so iteration 3 → variant 0, not a re-use of it
+        return v[(iteration - len(bootstrap)) % len(v)]

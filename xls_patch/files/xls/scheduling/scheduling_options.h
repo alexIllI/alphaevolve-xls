@@ -1,0 +1,778 @@
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
+#include "xls/ir/channel.h"
+#include "ortools/math_opt/cpp/math_opt.h"
+// Copyright 2022 The XLS Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef XLS_SCHEDULING_SCHEDULING_OPTIONS_H_
+#define XLS_SCHEDULING_SCHEDULING_OPTIONS_H_
+
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <ostream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
+#include "absl/status/statusor.h"
+#include "absl/types/span.h"
+#include "xls/estimators/delay_model/delay_estimator.h"
+#include "xls/ir/node.h"
+#include "xls/ir/package.h"
+#include "xls/passes/optimization_pass.h"
+#include "xls/tools/scheduling_options_flags.pb.h"
+
+namespace xls {
+
+inline constexpr double kDefaultSdcSolutionTolerance = 0.001;
+
+// The strategy to use when scheduling pipelines.
+enum class SchedulingStrategy : int8_t {
+  // Schedule all nodes a early as possible while satisfying dependency and
+  // timing constraints.
+  ASAP,
+
+  // Approximately minimize the number of pipeline registers when scheduling
+  // using a min-cut based algorithm.
+  MIN_CUT,
+
+  // Exactly minimize the number of pipeline registers when scheduling by
+  // solving a system of difference constraints.
+  SDC,
+
+  // Create a random but sound schedule. This is useful for testing.
+  RANDOM,
+
+  // A standalone heuristic scheduler intended for rapid algorithm iteration.
+  AGENT,
+};
+
+ProtoSchedulingStrategy ToProtoSchedulingStrategy(SchedulingStrategy strategy);
+SchedulingStrategy FromProtoSchedulingStrategy(
+    ProtoSchedulingStrategy strategy);
+
+bool AbslParseFlag(std::string_view text, SchedulingStrategy* strategy,
+                   std::string* error);
+std::string AbslUnparseFlag(const SchedulingStrategy& strategy);
+
+enum class PathEvaluateStrategy : int8_t {
+  PATH,
+  CONE,
+  WINDOW,
+};
+
+using IODirection = ChannelDirection;
+
+// This represents a constraint saying that interactions on the given
+// `source_channel` of the type specified by the given `source_direction`
+// must occur between `minimum_latency` and `maximum_latency` (inclusive) cycles
+// before interactions on the given `target_channel` of the type specified by
+// the given `target_direction`.
+class IOConstraint {
+ public:
+  IOConstraint(std::string_view source_channel, IODirection source_direction,
+               std::string_view target_channel, IODirection target_direction,
+               int64_t minimum_latency, int64_t maximum_latency)
+      : source_channel_(source_channel),
+        source_direction_(source_direction),
+        target_channel_(target_channel),
+        target_direction_(target_direction),
+        minimum_latency_(minimum_latency),
+        maximum_latency_(maximum_latency) {}
+
+  std::string SourceChannel() const { return source_channel_; }
+
+  IODirection SourceDirection() const { return source_direction_; }
+
+  std::string TargetChannel() const { return target_channel_; }
+
+  IODirection TargetDirection() const { return target_direction_; }
+
+  int64_t MinimumLatency() const { return minimum_latency_; }
+
+  int64_t MaximumLatency() const { return maximum_latency_; }
+
+  friend bool operator==(const IOConstraint& lhs, const IOConstraint& rhs) {
+    return lhs.source_channel_ == rhs.source_channel_ &&
+           lhs.source_direction_ == rhs.source_direction_ &&
+           lhs.target_channel_ == rhs.target_channel_ &&
+           lhs.target_direction_ == rhs.target_direction_ &&
+           lhs.minimum_latency_ == rhs.minimum_latency_ &&
+           lhs.maximum_latency_ == rhs.maximum_latency_;
+  }
+  friend bool operator!=(const IOConstraint& lhs, const IOConstraint& rhs) {
+    return !(lhs == rhs);
+  }
+
+  template <typename H>
+  friend H AbslHashValue(H h, const IOConstraint& s) {
+    return H::combine(std::move(h), s.source_channel_, s.source_direction_,
+                      s.target_channel_, s.target_direction_,
+                      s.minimum_latency_, s.maximum_latency_);
+  }
+
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, const IOConstraint& constraint) {
+    auto dir_to_string = [](IODirection dir) {
+      return dir == IODirection::kSend ? "send" : "recv";
+    };
+    auto min_limit_to_string = [](int64_t limit) -> std::string {
+      if (limit == std::numeric_limits<int64_t>::min()) {
+        return "none";
+      }
+      return absl::StrCat(limit);
+    };
+    auto max_limit_to_string = [](int64_t limit) -> std::string {
+      if (limit == std::numeric_limits<int64_t>::max()) {
+        return "none";
+      }
+      return absl::StrCat(limit);
+    };
+    absl::Format(&sink, "%s:%s:%s:%s:%s:%s", constraint.source_channel_,
+                 dir_to_string(constraint.source_direction_),
+                 constraint.target_channel_,
+                 dir_to_string(constraint.target_direction_),
+                 min_limit_to_string(constraint.minimum_latency_),
+                 max_limit_to_string(constraint.maximum_latency_));
+  }
+
+  friend std::ostream& operator<<(std::ostream& os,
+                                  const IOConstraint& constraint) {
+    os << absl::StreamFormat("%v", constraint);
+    return os;
+  }
+
+ private:
+  std::string source_channel_;
+  IODirection source_direction_;
+  std::string target_channel_;
+  IODirection target_direction_;
+  int64_t minimum_latency_;
+  int64_t maximum_latency_;
+};
+
+// Force the given node into the given cycle. This is used for incremental
+// scheduling in the scheduling pass pipeline, and is not currently exposed to
+// users through codegen_main.
+class NodeInCycleConstraint {
+ public:
+  NodeInCycleConstraint(Node* node, int64_t cycle)
+      : node_(node), cycle_(cycle) {}
+
+  Node* GetNode() const { return node_; }
+  int64_t GetCycle() const { return cycle_; }
+
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink,
+                            const NodeInCycleConstraint& constraint) {
+    absl::Format(&sink, "%s@%d", constraint.GetNode()->GetName(),
+                 constraint.GetCycle());
+  }
+
+  friend std::ostream& operator<<(std::ostream& os,
+                                  const NodeInCycleConstraint& constraint) {
+    os << absl::StreamFormat("%v", constraint);
+    return os;
+  }
+
+ private:
+  Node* node_;
+  int64_t cycle_;
+};
+
+// Force the given node to be less than or less than or equal to another node.
+// The constraint will be `a - b ≤ max_difference`, so if you want to express
+// `a ≤ b`, set max_difference to 0, and if you want to express `a < b`, set
+// max_difference to -1.
+//
+// TODO(allight): This seems to be dead. Should we remove it.
+class DifferenceConstraint {
+ public:
+  DifferenceConstraint(Node* a, Node* b, int64_t max_difference)
+      : a_(a), b_(b), max_difference_(max_difference) {}
+
+  Node* GetA() const { return a_; }
+  Node* GetB() const { return b_; }
+  int64_t GetMaxDifference() const { return max_difference_; }
+
+  friend std::ostream& operator<<(std::ostream& os,
+                                  const DifferenceConstraint& constraint) {
+    os << absl::StreamFormat("%s - %s <= %d", constraint.GetA()->GetName(),
+                             constraint.GetB()->GetName(),
+                             constraint.GetMaxDifference());
+    return os;
+  }
+
+ private:
+  Node* a_;
+  Node* b_;
+  int64_t max_difference_;
+};
+
+// When this is present, receives will be scheduled in the first cycle and sends
+// will be scheduled in the last cycle.
+class RecvsFirstSendsLastConstraint {
+ public:
+  RecvsFirstSendsLastConstraint() = default;
+  friend std::ostream& operator<<(
+      std::ostream& os, const RecvsFirstSendsLastConstraint& constraint) {
+    os << "RecvsFirstSendsLastConstraint";
+    return os;
+  }
+};
+
+// When this is present, state backedges will be forced to span over at most II
+// cycles.
+class BackedgeConstraint {
+ public:
+  BackedgeConstraint() = default;
+  friend std::ostream& operator<<(std::ostream& os,
+                                  const BackedgeConstraint& constraint) {
+    os << "BackedgeConstraint";
+    return os;
+  }
+};
+
+// When this is present, whenever we have a receive with a dependency on a send,
+// the receive will always be scheduled at least `MinimumLatency()` cycles
+// later. Since codegen currently blocks all execution within a stage if it
+// contains a blocked receive, having this present with minimum latency 1 more
+// accurately represents the user's expressed dependencies.
+class SendThenRecvConstraint {
+ public:
+  explicit SendThenRecvConstraint(int64_t minimum_latency)
+      : minimum_latency_(minimum_latency) {}
+
+  int64_t MinimumLatency() const { return minimum_latency_; }
+
+  friend std::ostream& operator<<(std::ostream& os,
+                                  const SendThenRecvConstraint& constraint) {
+    os << "SendThenRecvConstraint(" << constraint.MinimumLatency() << ")";
+    return os;
+  }
+
+ private:
+  int64_t minimum_latency_;
+};
+
+// When this is present, whenever we have a dependency between two operations on
+// the same channel, the dependent operation will always be scheduled at least
+// `MinimumLatency()` cycles later. This ensures that we don't try to execute
+// two operations on the same channel at the same time.
+class SameChannelConstraint {
+ public:
+  explicit SameChannelConstraint(int64_t minimum_latency)
+      : minimum_latency_(minimum_latency) {}
+
+  int64_t MinimumLatency() const { return minimum_latency_; }
+
+  friend std::ostream& operator<<(std::ostream& os,
+                                  const SameChannelConstraint& constraint) {
+    os << "SameChannelConstraint(" << constraint.MinimumLatency() << ")";
+    return os;
+  }
+
+ private:
+  int64_t minimum_latency_;
+};
+
+using SchedulingConstraint =
+    std::variant<IOConstraint, NodeInCycleConstraint, DifferenceConstraint,
+                 RecvsFirstSendsLastConstraint, BackedgeConstraint,
+                 SendThenRecvConstraint, SameChannelConstraint>;
+
+// Options for what the scheduler should do if scheduling fails.
+struct SchedulingFailureBehavior {
+  static SchedulingFailureBehavior FromProto(
+      const SchedulingFailureBehaviorProto& proto) {
+    SchedulingFailureBehavior failure_behavior;
+    failure_behavior.explain_infeasibility = proto.explain_infeasibility();
+    if (proto.has_infeasible_per_state_backedge_slack_pool()) {
+      failure_behavior.infeasible_per_state_backedge_slack_pool =
+          proto.infeasible_per_state_backedge_slack_pool();
+    }
+    return failure_behavior;
+  }
+  SchedulingFailureBehaviorProto ToProto() const {
+    SchedulingFailureBehaviorProto proto;
+    proto.set_explain_infeasibility(explain_infeasibility);
+    if (infeasible_per_state_backedge_slack_pool.has_value()) {
+      proto.set_infeasible_per_state_backedge_slack_pool(
+          *infeasible_per_state_backedge_slack_pool);
+    }
+    return proto;
+  }
+
+  // If scheduling fails, re-run scheduling with extra slack variables in an
+  // attempt to explain why scheduling failed.
+  bool explain_infeasibility = true;
+
+  // If specified, the specified value must be > 0. Setting this configures how
+  // the scheduling problem is reformulated in the case that it fails. If
+  // specified, this value will cause the reformulated problem to include
+  // per-state backedge slack variables, which increases the complexity. This
+  // value scales the objective such that adding slack to the per-state backedge
+  // is preferred up until total slack reaches the pool size, after which adding
+  // slack to the shared backedge slack variable is preferred. Increasing this
+  // value should give more specific information about how much slack each
+  // failing backedge needs at the cost of less actionable and harder to
+  // understand output.
+  std::optional<double> infeasible_per_state_backedge_slack_pool;
+};
+
+// Options to use when generating a pipeline schedule. At least a clock period
+// or a pipeline length (or both) must be specified. See
+// https://google.github.io/xls/scheduling/ for details on these options.
+class SchedulingOptions {
+ public:
+  explicit SchedulingOptions(
+      SchedulingStrategy strategy = SchedulingStrategy::SDC)
+      : strategy_(strategy),
+        opt_level_(kMaxOptLevel),
+        minimize_clock_on_failure_(true),
+        recover_after_minimizing_clock_(false),
+        minimize_worst_case_throughput_(false),
+        constraints_({
+            BackedgeConstraint(),
+            SendThenRecvConstraint(/*minimum_latency=*/1),
+            SameChannelConstraint(/*minimum_latency=*/1),
+        }),
+        use_fdo_(false),
+        fdo_iteration_number_(5),
+        fdo_delay_driven_path_number_(1),
+        fdo_fanout_driven_path_number_(0),
+        fdo_refinement_stochastic_ratio_(1.0),
+        fdo_path_evaluate_strategy_(PathEvaluateStrategy::WINDOW),
+        fdo_synthesizer_name_("yosys"),
+        schedule_all_procs_(false),
+        sdc_solution_tolerance_(kDefaultSdcSolutionTolerance),
+        solver_type_(operations_research::math_opt::SolverType::kGlop),
+        solve_parameters_(),
+        merge_on_mutual_exclusion_(true) {}
+
+  // Returns the scheduling strategy.
+  SchedulingStrategy strategy() const { return strategy_; }
+  SchedulingOptions& strategy(SchedulingStrategy strategy) {
+    strategy_ = strategy;
+    return *this;
+  }
+
+  // Sets/gets the target delay model
+  SchedulingOptions& opt_level(int64_t value) {
+    opt_level_ = value;
+    return *this;
+  }
+  int64_t opt_level() const { return opt_level_; }
+
+  // Sets/gets the target delay model
+  SchedulingOptions& delay_model(std::string_view value) {
+    delay_model_ = std::string(value);
+    return *this;
+  }
+  std::optional<std::string> delay_model() const { return delay_model_; }
+
+  // Sets/gets the target clock period in picoseconds.
+  SchedulingOptions& clock_period_ps(int64_t value) {
+    clock_period_ps_ = value;
+    return *this;
+  }
+  std::optional<int64_t> clock_period_ps() const { return clock_period_ps_; }
+
+  // Sets/gets the target number of stages in the pipeline.
+  SchedulingOptions& pipeline_stages(int64_t value) {
+    pipeline_stages_ = value;
+    return *this;
+  }
+  std::optional<int64_t> pipeline_stages() const { return pipeline_stages_; }
+
+  // Sets/gets the percentage of clock period to set aside as a margin to ensure
+  // timing is met. Effectively, this lowers the clock period by this percentage
+  // amount for the purposes of scheduling.
+  SchedulingOptions& clock_margin_percent(int64_t value) {
+    clock_margin_percent_ = value;
+    return *this;
+  }
+  std::optional<int64_t> clock_margin_percent() const {
+    return clock_margin_percent_;
+  }
+
+  // Sets/gets the percentage of the estimated minimum period to relax so that
+  // the scheduler may have more options to find an area-efficient
+  // schedule without impacting timing.
+  SchedulingOptions& period_relaxation_percent(int64_t value) {
+    period_relaxation_percent_ = value;
+    return *this;
+  }
+  std::optional<int64_t> period_relaxation_percent() const {
+    return period_relaxation_percent_;
+  }
+
+  // Sets/gets whether to report the fastest feasible clock if scheduling is
+  // infeasible at the user's specified clock.
+  SchedulingOptions& minimize_clock_on_failure(bool value) {
+    minimize_clock_on_failure_ = value;
+    return *this;
+  }
+  std::optional<bool> minimize_clock_on_failure() const {
+    return minimize_clock_on_failure_;
+  }
+
+  // Sets/gets whether to fall back to the fastest feasible clock if scheduling
+  // is infeasible at the user's specified clock.
+  SchedulingOptions& recover_after_minimizing_clock(bool value) {
+    recover_after_minimizing_clock_ = value;
+    return *this;
+  }
+  std::optional<bool> recover_after_minimizing_clock() const {
+    return recover_after_minimizing_clock_;
+  }
+
+  // Sets/gets whether to find the fastest feasible worst-case throughput if the
+  // user has not specified a worst-case throughput bound.
+  SchedulingOptions& minimize_worst_case_throughput(bool value) {
+    minimize_worst_case_throughput_ = value;
+    return *this;
+  }
+  std::optional<bool> minimize_worst_case_throughput() const {
+    return minimize_worst_case_throughput_;
+  }
+
+  // Sets/gets the worst-case throughput bound to use when scheduling; for
+  // procs, controls the length of state backedges allowed in scheduling.
+  SchedulingOptions& worst_case_throughput(int64_t value) {
+    worst_case_throughput_ = value;
+    return *this;
+  }
+  std::optional<int64_t> worst_case_throughput() const {
+    return worst_case_throughput_;
+  }
+
+  // Sets/gets the weight of the dynamic throughput objective for the SDC
+  // scheduler. Only relevant if worst-case throughput is set to a value != 1.
+  // std::nullopt disables the dynamic throughput objective.
+  SchedulingOptions& dynamic_throughput_objective_weight(
+      std::optional<double> value) {
+    dynamic_throughput_objective_weight_ = value;
+    return *this;
+  }
+  std::optional<double> dynamic_throughput_objective_weight() const {
+    return dynamic_throughput_objective_weight_;
+  }
+
+  // Sets/gets the additional delay added to each input.
+  //
+  // TODO(tedhong): 2022-02-11, Update so that this sets/gets the
+  // additional delay added to each input path.
+  SchedulingOptions& additional_input_delay_ps(int64_t value) {
+    additional_input_delay_ps_ = value;
+    return *this;
+  }
+  std::optional<int64_t> additional_input_delay_ps() const {
+    return additional_input_delay_ps_;
+  }
+
+  // Sets/gets the additional delay added to each output.
+  SchedulingOptions& additional_output_delay_ps(int64_t value) {
+    additional_output_delay_ps_ = value;
+    return *this;
+  }
+  std::optional<int64_t> additional_output_delay_ps() const {
+    return additional_output_delay_ps_;
+  }
+
+  // Sets/gets the additional delay added to each external channel.
+  SchedulingOptions& additional_channel_delay_ps(
+      absl::flat_hash_map<std::string, int64_t> delay) {
+    additional_channel_delay_ps_ = std::move(delay);
+    return *this;
+  }
+  SchedulingOptions& add_additional_channel_delay_ps(
+      std::string_view channel_name, int64_t delay_ps) {
+    additional_channel_delay_ps_[channel_name] = delay_ps;
+    return *this;
+  }
+  const absl::flat_hash_map<std::string, int64_t>& additional_channel_delay_ps()
+      const {
+    return additional_channel_delay_ps_;
+  }
+  std::optional<int64_t> additional_channel_delay_ps(
+      std::string_view channel_name) const {
+    auto it = additional_channel_delay_ps_.find(channel_name);
+    if (it == additional_channel_delay_ps_.end()) {
+      return std::nullopt;
+    }
+    return it->second;
+  }
+
+  // Set fallback estimation for ffi calls used in absence of more information.
+  SchedulingOptions& ffi_fallback_delay_ps(int64_t value) {
+    ffi_fallback_delay_ps_ = value;
+    return *this;
+  }
+  std::optional<int64_t> ffi_fallback_delay_ps() const {
+    return ffi_fallback_delay_ps_;
+  }
+
+  // Add a constraint to the set of scheduling constraints.
+  SchedulingOptions& add_constraint(const SchedulingConstraint& constraint) {
+    constraints_.push_back(constraint);
+    return *this;
+  }
+  SchedulingOptions& clear_constraints() {
+    constraints_.clear();
+    return *this;
+  }
+  absl::Span<const SchedulingConstraint> constraints() const {
+    return constraints_;
+  }
+
+  // The random seed, which is only used if the scheduler is `RANDOM`.
+  SchedulingOptions& seed(int32_t value) {
+    seed_ = value;
+    return *this;
+  }
+  std::optional<int32_t> seed() const { return seed_; }
+
+  // The rlimit used for mutual exclusion analysis.
+  SchedulingOptions& mutual_exclusion_z3_rlimit(int64_t value) {
+    mutual_exclusion_z3_rlimit_ = value;
+    return *this;
+  }
+  std::optional<int64_t> mutual_exclusion_z3_rlimit() const {
+    return mutual_exclusion_z3_rlimit_;
+  }
+
+  // The rlimit used for default next-value omission optimization.
+  SchedulingOptions& default_next_value_z3_rlimit(int64_t value) {
+    default_next_value_z3_rlimit_ = value;
+    return *this;
+  }
+  std::optional<int64_t> default_next_value_z3_rlimit() const {
+    return default_next_value_z3_rlimit_;
+  }
+
+  // Struct that configures what should be done when scheduling fails. The
+  // scheduling problem can be reformulated to give actionable feedback on how
+  // to get a feasible schedule.
+  SchedulingOptions& failure_behavior(SchedulingFailureBehavior value) {
+    failure_behavior_ = value;
+    return *this;
+  }
+  SchedulingFailureBehavior failure_behavior() const {
+    return failure_behavior_;
+  }
+
+  // Enable FDO
+  SchedulingOptions& use_fdo(bool value) {
+    use_fdo_ = value;
+    return *this;
+  }
+  bool use_fdo() const { return use_fdo_; }
+
+  // The number of FDO iterations during the pipeline scheduling.
+  SchedulingOptions& fdo_iteration_number(int64_t value) {
+    fdo_iteration_number_ = value;
+    return *this;
+  }
+  int64_t fdo_iteration_number() const { return fdo_iteration_number_; }
+
+  // The number of delay-driven subgraphs in each FDO iteration.
+  SchedulingOptions& fdo_delay_driven_path_number(int64_t value) {
+    fdo_delay_driven_path_number_ = value;
+    return *this;
+  }
+  int64_t fdo_delay_driven_path_number() const {
+    return fdo_delay_driven_path_number_;
+  }
+
+  // The number of fanout-driven subgraphs in each FDO iteration.
+  SchedulingOptions& fdo_fanout_driven_path_number(int64_t value) {
+    fdo_fanout_driven_path_number_ = value;
+    return *this;
+  }
+  int64_t fdo_fanout_driven_path_number() const {
+    return fdo_fanout_driven_path_number_;
+  }
+
+  // *path_number over refinement_stochastic_ratio paths are extracted and
+  // *path_number paths are randomly selected from them for synthesis in each
+  // FDO iteration.
+  SchedulingOptions& fdo_refinement_stochastic_ratio(float value) {
+    fdo_refinement_stochastic_ratio_ = value;
+    return *this;
+  }
+  float fdo_refinement_stochastic_ratio() const {
+    return fdo_refinement_stochastic_ratio_;
+  }
+
+  // Support window, cone, and path for now.
+  SchedulingOptions& fdo_path_evaluate_strategy(std::string_view value) {
+    if (value == "path") {
+      fdo_path_evaluate_strategy_ = PathEvaluateStrategy::PATH;
+    } else if (value == "cone") {
+      fdo_path_evaluate_strategy_ = PathEvaluateStrategy::CONE;
+    } else {
+      CHECK_EQ(value, "window") << "Unknown path evaluate strategy: " << value;
+      fdo_path_evaluate_strategy_ = PathEvaluateStrategy::WINDOW;
+    }
+    return *this;
+  }
+  PathEvaluateStrategy fdo_path_evaluate_strategy() const {
+    return fdo_path_evaluate_strategy_;
+  }
+
+  // Only support yosys for now.
+  SchedulingOptions& fdo_synthesizer_name(std::string_view value) {
+    fdo_synthesizer_name_ = value;
+    return *this;
+  }
+  std::string fdo_synthesizer_name() const { return fdo_synthesizer_name_; }
+
+  // Yosys path
+  SchedulingOptions& fdo_yosys_path(std::string_view value) {
+    fdo_yosys_path_ = value;
+    return *this;
+  }
+  std::string fdo_yosys_path() const { return fdo_yosys_path_; }
+
+  // STA path
+  SchedulingOptions& fdo_sta_path(std::string_view value) {
+    fdo_sta_path_ = value;
+    return *this;
+  }
+  std::string fdo_sta_path() const { return fdo_sta_path_; }
+
+  // Path to synth library (Liberty file)
+  SchedulingOptions& fdo_synthesis_libraries(std::string_view value) {
+    fdo_synthesis_libraries_ = value;
+    return *this;
+  }
+  std::string fdo_synthesis_libraries() const {
+    return fdo_synthesis_libraries_;
+  }
+
+  // Cell to assume is driving primary inputs
+  SchedulingOptions& fdo_default_driver_cell(std::string_view value) {
+    fdo_default_driver_cell_ = value;
+    return *this;
+  }
+  std::string fdo_default_driver_cell() const {
+    return fdo_default_driver_cell_;
+  }
+
+  // Cell to assume is being driven by primary outputs
+  SchedulingOptions& fdo_default_load(std::string_view value) {
+    fdo_default_load_ = value;
+    return *this;
+  }
+  std::string fdo_default_load() const { return fdo_default_load_; }
+
+  SchedulingOptions& schedule_all_procs(bool value) {
+    schedule_all_procs_ = value;
+    return *this;
+  }
+  bool schedule_all_procs() const { return schedule_all_procs_; }
+
+  SchedulingOptions& sdc_solution_tolerance(double value) {
+    sdc_solution_tolerance_ = value;
+    return *this;
+  }
+  double sdc_solution_tolerance() const { return sdc_solution_tolerance_; }
+
+  SchedulingOptions& set_solver_type(
+      ::operations_research::math_opt::SolverType value) {
+    solver_type_ = value;
+    return *this;
+  }
+  ::operations_research::math_opt::SolverType solver_type() const {
+    return solver_type_;
+  }
+
+  SchedulingOptions& set_solve_parameters(
+      ::operations_research::math_opt::SolveParameters&& value) {
+    solve_parameters_ = std::move(value);
+    return *this;
+  }
+  ::operations_research::math_opt::SolveParameters solve_parameters() const {
+    return solve_parameters_;
+  }
+
+  SchedulingOptions& merge_on_mutual_exclusion(bool value) {
+    merge_on_mutual_exclusion_ = value;
+    return *this;
+  }
+  bool merge_on_mutual_exclusion() const { return merge_on_mutual_exclusion_; }
+
+ private:
+  SchedulingStrategy strategy_;
+  int64_t opt_level_;
+  std::optional<int64_t> clock_period_ps_;
+  std::optional<std::string> delay_model_;
+  std::optional<int64_t> pipeline_stages_;
+  std::optional<int64_t> clock_margin_percent_;
+  std::optional<int64_t> period_relaxation_percent_;
+  bool minimize_clock_on_failure_;
+  bool recover_after_minimizing_clock_;
+  bool minimize_worst_case_throughput_;
+  std::optional<int64_t> worst_case_throughput_;
+  std::optional<double> dynamic_throughput_objective_weight_;
+  std::optional<int64_t> additional_input_delay_ps_;
+  std::optional<int64_t> additional_output_delay_ps_;
+  absl::flat_hash_map<std::string, int64_t> additional_channel_delay_ps_;
+  std::optional<int64_t> ffi_fallback_delay_ps_;
+  std::vector<SchedulingConstraint> constraints_;
+  std::optional<int32_t> seed_;
+  std::optional<int64_t> mutual_exclusion_z3_rlimit_;
+  std::optional<int64_t> default_next_value_z3_rlimit_;
+  SchedulingFailureBehavior failure_behavior_;
+  bool use_fdo_;
+  int64_t fdo_iteration_number_;
+  int64_t fdo_delay_driven_path_number_;
+  int64_t fdo_fanout_driven_path_number_;
+  float fdo_refinement_stochastic_ratio_;
+  PathEvaluateStrategy fdo_path_evaluate_strategy_;
+  std::string fdo_synthesizer_name_;
+  std::string fdo_yosys_path_;
+  std::string fdo_sta_path_;
+  std::string fdo_synthesis_libraries_;
+  std::string fdo_default_driver_cell_;
+  std::string fdo_default_load_;
+  bool schedule_all_procs_;
+  double sdc_solution_tolerance_;
+  ::operations_research::math_opt::SolverType solver_type_;
+  ::operations_research::math_opt::SolveParameters solve_parameters_;
+  bool merge_on_mutual_exclusion_;
+};
+
+// A map from node to cycle as a bare-bones representation of a schedule.
+using ScheduleCycleMap = absl::flat_hash_map<Node*, int64_t>;
+
+absl::StatusOr<SchedulingOptions> SetUpSchedulingOptions(
+    const SchedulingOptionsFlagsProto& flags, const Package* p);
+
+absl::StatusOr<DelayEstimator*> SetUpDelayEstimator(
+    const SchedulingOptionsFlagsProto& flags);
+absl::StatusOr<bool> IsDelayModelSpecifiedViaFlag(
+    const SchedulingOptionsFlagsProto& flags);
+
+}  // namespace xls
+
+#endif  // XLS_SCHEDULING_SCHEDULING_OPTIONS_H_
