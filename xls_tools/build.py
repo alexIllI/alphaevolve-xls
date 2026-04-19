@@ -175,7 +175,8 @@ class XLSBuilder:
                 cmd,
                 cwd=self.xls_src,
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",   # Bazel emits non-UTF-8 progress bytes; replace safely
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired as e:
@@ -234,7 +235,8 @@ class XLSBuilder:
             result = subprocess.run(
                 [str(binary), "--scheduling_strategy=agent"],
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
             )
             return "Unknown scheduling strategy" not in result.stderr

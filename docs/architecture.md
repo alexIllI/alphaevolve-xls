@@ -316,6 +316,106 @@ python run.py \
 
 ---
 
+## Part 3.5 — Compile failure and retry loop
+
+This section explains exactly what happens when the AI generates C++ that does not compile, what gets fed back, and how the loop decides to retry or give up.
+
+### The retry wrapper (run.py)
+
+Each iteration is wrapped in a retry loop controlled by `max_build_retries` (default: 3, set in `evolve_config.yaml`):
+
+```
+for attempt in 1 .. max_build_retries:
+
+    generated_code = sampler.sample(..., compile_error=last_compile_error)
+    result         = evaluator.evaluate(..., generated_code=generated_code)
+
+    if result.candidate.build_status == "success":
+        break                     # compiled → exit retry loop
+
+    last_compile_error = trim(result.candidate.notes)
+
+# record whichever result came last (even if build_failed)
+```
+
+On attempt 1, `compile_error=None` — the prompt does not mention a previous failure.
+On attempts 2 and 3, `compile_error` is the trimmed Clang output from the previous attempt.
+
+### What gets trimmed and passed back
+
+`build_result.stderr` contains the full Bazel + Clang output (often thousands of lines).
+`run.py` filters it before handing it to the AI:
+
+```python
+error_lines = [l for l in stderr.splitlines() if "error:" in l or "note:" in l]
+last_compile_error = "\n".join(error_lines[:30])
+```
+
+Only lines containing `error:` or `note:` are kept, capped at 30 lines. This strips
+Bazel progress noise, INFO lines, and long include stacks, leaving the AI with the
+smallest message that still identifies every error location and cause.
+
+The trimmed text is injected into the prompt template under:
+
+```
+== PREVIOUS ATTEMPT FAILED TO COMPILE ==
+Compiler output:
+<trimmed error here>
+
+Fix every compiler issue before writing the next version.
+```
+
+### How the AI uses the error
+
+The prompt instructs the AI to fix the specific C++ issue first and only then consider changing algorithmic details. A typical error message looks like:
+
+```
+xls/scheduling/agent_generated_scheduler.cc:47:5: error: use of undeclared identifier 'NodeCost'
+xls/scheduling/agent_generated_scheduler.cc:47:5: note: did you mean 'NodeBitCount'?
+xls/scheduling/agent_generated_scheduler.cc:83:12: error: expected ';' after return statement
+```
+
+The AI sees the file, line, column, and a human-readable description — enough to pinpoint and fix each issue without seeing the surrounding XLS source again.
+
+### Build status values and what they mean
+
+| `build_status` | Meaning | Retried? |
+|----------------|---------|----------|
+| `success` | Bazel returned 0; C++ compiled and linked. | — (done) |
+| `build_failed` | Bazel returned non-zero; Clang rejected the AI's C++. | **Yes** — error fed back to AI, up to `max_build_retries` attempts. |
+| `run_failed` | Compiled fine, but no design produced valid PPA in the pipeline (clock period exceeded, proc design in fast mode, scheduler timeout, etc.). | **No** — this is a runtime outcome, not a code defect. The candidate is recorded and the loop moves to the next iteration. |
+
+### What counts as a build failure vs a run failure
+
+**`build_failed`** — the generated C++ itself is broken. Common causes:
+- `#include` directives added by the AI that conflict with existing includes
+- `namespace xls { }` wrapper re-nesting the code (already inside `namespace xls`)
+- Calls to functions that don't exist in the scheduler API (`NodeCost`, `GetDelay`, etc.)
+- Syntax errors, missing semicolons, unmatched braces
+- Type mismatches (e.g. returning `int` where `absl::StatusOr<ScheduleCycleMap>` is required)
+
+**`run_failed`** — the C++ compiled, but the schedule was not accepted or produced no PPA. Common causes:
+- AI-generated scheduler returns a map where some node cycles violate `[lb, ub]` bounds
+- Clock period constraint not satisfiable with the generated schedule
+- `benchmark_main` or `codegen_main` timed out (AI scheduler too slow — e.g. O(n²) inner loop on a large design)
+- Design is a proc network and `--ppa_mode fast` was used (proc designs need `--ppa_mode slow`)
+
+`run_failed` is **not** fed back to the AI as an error. The candidate is stored in the database with `ppa_score=inf` so it ranks last in island selection, and the next iteration starts fresh with a new AI call.
+
+### What happens if all retries are exhausted
+
+After `max_build_retries` failed compile attempts, the loop records the last `build_failed` candidate (with the most recent error in `notes`) and moves on to the next iteration. The island population is updated (the failing candidate is added with `ppa_score=inf`), so the next iteration's parent selection will avoid it.
+
+No exception is raised; the run continues normally.
+
+### Restore safety
+
+`evaluator.evaluate()` wraps the backup → apply → build → run sequence in a `try/finally` block. The `finally` always calls `builder.restore(target_file)` regardless of whether a `build_failed`, `run_failed`, `TimeoutExpired`, or any other exception occurred. This ensures `agent_generated_scheduler.cc` is always returned to its baseline state before the next iteration begins.
+
+On startup, `run.py` also checks for a leftover `.bak` file (left by a previous run that was killed before the `finally` could execute) and auto-restores it with a warning.
+
+---
+
 ## Part 4 — XLS pipeline, command level
 
 ### Stage 1: DSLX → IR

@@ -123,9 +123,13 @@ class Evaluator:
                 XLSBuilder.iteration_targets_for_mode(self.ppa_mode)
             )
             if not build_result.success:
+                # Store the full stderr — truncation happens in run.py when
+                # the error is fed back to the AI (where brevity matters).
+                # Here we keep everything so post-run analysis has the full
+                # clang/linker output available in the DB and attempt logs.
                 error_msg = (
                     f"Bazel build failed in {build_result.duration_seconds:.1f}s:\n"
-                    f"{build_result.stderr[-2000:]}"
+                    f"{build_result.stderr}"
                 )
             else:
                 # ── Run XLS pipeline on all benchmark designs ─────────────────
@@ -273,21 +277,21 @@ class Evaluator:
                 notes.append("removed closing code fence")
             text = text.strip()
 
+        # Strip ALL #include lines — the AI must never emit them.
+        # The original .cc file already has the necessary includes; any
+        # #include in the AI output will land in the middle of the spliced
+        # file and cause a compile error regardless of where they appear
+        # (even after a leading comment, which the old prefix-only approach
+        # could not catch).
         lines = text.splitlines()
-        kept_lines: list[str] = []
-        stripping_prefix = True
-        removed_includes = False
-        for line in lines:
-            stripped = line.strip()
-            if stripping_prefix and (not stripped or stripped.startswith("#include ")):
-                if stripped.startswith("#include "):
-                    removed_includes = True
-                continue
-            stripping_prefix = False
-            kept_lines.append(line)
-        if removed_includes:
-            notes.append("removed leading includes")
-        text = "\n".join(kept_lines).strip()
+        filtered_lines = [ln for ln in lines if not ln.strip().startswith("#include ")]
+        if len(filtered_lines) < len(lines):
+            notes.append("removed #include lines")
+        # Also drop blank lines that were sandwiched between removed includes
+        # at the very top (keeps the output clean).
+        while filtered_lines and not filtered_lines[0].strip():
+            filtered_lines.pop(0)
+        text = "\n".join(filtered_lines).strip()
 
         namespace_match = re.match(r"^\s*namespace\s+xls\s*\{", text)
         if namespace_match:

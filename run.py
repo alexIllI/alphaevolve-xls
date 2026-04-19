@@ -514,6 +514,14 @@ def main() -> int:
         last_compile_error: str | None = None
         result = None
 
+        # Per-iteration attempt log — written for every attempt so post-run
+        # analysis can replay exactly what the AI generated and what failed.
+        attempt_log_path = (
+            evaluator.output_dir
+            / f"iter{iteration:04d}_island{island.id}_attempts.log"
+        )
+        attempt_log_lines: list[str] = []
+
         for attempt in range(1, max_retries + 1):
             attempt_label = f"attempt {attempt}/{max_retries}" if attempt > 1 else ""
 
@@ -538,6 +546,10 @@ def main() -> int:
                 )
             except Exception as e:
                 log.error(f"AI sampling failed: {e}")
+                attempt_log_lines.append(
+                    f"=== Attempt {attempt}/{max_retries} — AI SAMPLING FAILED ===\n"
+                    f"Error: {e}\n"
+                )
                 break   # sampling itself failed — no point retrying
 
             # ── Evaluate (patch → build → run → score) ────────────────────────
@@ -553,18 +565,47 @@ def main() -> int:
 
             c = result.candidate
 
-            if c.build_status == "success":
-                break   # ✓ compiled — exit retry loop
+            # ── Log this attempt to disk (all attempts, win or lose) ──────────
+            attempt_log_lines.append(
+                f"=== Attempt {attempt}/{max_retries} "
+                f"| status={c.build_status} "
+                f"| build={c.build_duration_s:.1f}s ===\n"
+                f"--- Generated code ---\n{generated_code}\n"
+                f"--- Notes / error ---\n{c.notes or '(none)'}\n"
+            )
+            attempt_log_path.write_text(
+                "\n".join(attempt_log_lines), encoding="utf-8"
+            )
 
-            # Extract compile error for next attempt
-            last_compile_error = c.notes or "Build failed (no error details)"
-            # Trim to the most useful part: just the clang errors
-            if "error:" in last_compile_error:
-                error_lines = [
-                    l for l in last_compile_error.splitlines()
-                    if "error:" in l or "note:" in l
-                ]
-                last_compile_error = "\n".join(error_lines[:30])
+            if c.build_status == "success":
+                break   # ✓ compiled and scheduled — exit retry loop
+
+            # ── run_failed: scheduler compiled but produced no feasible schedule ─
+            # Don't retry as a "compile error" — the C++ was valid; the schedule
+            # is infeasible for this clock period / design.  Stop retrying now so
+            # we don't waste two more AI calls mislabelled as compile fixes.
+            if c.build_status == "run_failed":
+                break
+
+            # ── build_failed: compiler/linker rejected the C++ ───────────────
+            # Build the error string fed back to the AI on the next attempt.
+            # Keep more context than just error:/note: lines so the AI can
+            # locate the offending construct (include surrounding lines too).
+            raw_error = c.notes or "Build failed (no error details)"
+            if "error:" in raw_error:
+                error_lines = raw_error.splitlines()
+                # Keep every line that carries a clang error, note, or the
+                # immediately surrounding context (file:line: patterns).
+                useful: list[str] = []
+                for i, ln in enumerate(error_lines):
+                    if any(tag in ln for tag in ("error:", "note:", "warning:", " ^ ")):
+                        # Include one line of context before and after each hit
+                        for j in range(max(0, i - 1), min(len(error_lines), i + 2)):
+                            if error_lines[j] not in useful:
+                                useful.append(error_lines[j])
+                last_compile_error = "\n".join(useful[:60])
+            else:
+                last_compile_error = raw_error[:3000]
 
             if attempt < max_retries:
                 console.print(
