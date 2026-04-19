@@ -1,6 +1,6 @@
 # AlphaEvolve-XLS — System Architecture
 
-> Last updated: 2026-04-18 — reflects agent-scheduler-only design, `--clock_period` CLI flag, optional baseline benchmark context, and `--ppa_mode` behavior.
+> Last updated: 2026-04-18 — reflects agent-scheduler-only design, `--clock_period` CLI flag, optional baseline benchmark context, `--ppa_mode` behavior, `--benchmark_timeout` flag, runtime scoring, per-stage console callbacks, and slow-mode build-target optimisation.
 
 This document is the reference for how AlphaEvolve-XLS is wired together internally. `README.md` is the user-facing guide; this file covers the internals.
 
@@ -116,26 +116,41 @@ alphaevolve-xls/
 │       └── implement_agent_scheduler.txt  Active template used by sampler.py.
 │
 ├── xls_tools/
-│   ├── build.py                    Bazel wrapper. Iteration targets:
-│   │                                 //xls/scheduling:agent_generated_scheduler
-│   │                                 //xls/tools:codegen_main
-│   │                                 //xls/tools:opt_main
-│   │                                 //xls/dslx/ir_convert:ir_converter_main
-│   │                                 //xls/dev_tools:benchmark_main  (slow only)
+│   ├── build.py                    Bazel wrapper. Iteration targets per mode:
+│   │                                 fast|medium → agent_generated_scheduler
+│   │                                               + codegen_main + opt_main
+│   │                                               + ir_converter_main
+│   │                                 slow|slowest → agent_generated_scheduler
+│   │                                               + benchmark_main ONLY
+│   │                                               (codegen_main is NOT rebuilt
+│   │                                               per iteration in slow mode —
+│   │                                               it was built once at startup)
 │   │                               `supports_agent_strategy(tool)` probes whether
 │   │                               the existing binary already supports agent mode,
 │   │                               skipping the rebuild when possible.
 │   │                               `iteration_targets_for_mode(mode)` returns the
 │   │                               correct target list per ppa_mode.
+│   │                               Subprocess calls use encoding="utf-8",
+│   │                               errors="replace" to survive Bazel's non-UTF-8
+│   │                               terminal progress bars (0x80 bytes).
 │   └── pipeline.py                 DSLX → IR → opt → schedule → Verilog.
 │                                   Always uses --scheduling_strategy=agent.
-│                                   `run(..., ppa_mode=...)`:
+│                                   `__init__` accepts `benchmark_timeout` (int,
+│                                   default 1800 s) — kills benchmark_main after
+│                                   this many seconds; timeout records runtime_s=3600.
+│                                   `run(..., ppa_mode=..., on_stage_start=..., on_stage=...)`:
+│                                     on_stage_start(name, extra) — called before each
+│                                       XLS stage; used by run.py to update the spinner.
+│                                     on_stage(name, status, duration_s, extra) — called
+│                                       after each stage completes; logged to stages.log.
 │                                     fast|medium: block_metrics only; codegen_main
 │                                       failure is a hard fail (no PPA) for function
 │                                       designs. Proc designs fail codegen; use slow.
 │                                     slow|slowest: also runs benchmark_main;
 │                                       codegen failure is non-fatal when benchmark_main
 │                                       produced metrics (handles proc networks).
+│                                   benchmark_main stage shown as "AI scheduler" in the
+│                                   console — it runs the AI's C++ code, not just linking.
 │
 ├── knowledge/
 │   ├── papers/*.md                 Scheduling-theory summaries. Loaded into prompts.
@@ -148,7 +163,7 @@ alphaevolve-xls/
 
 ---
 
-## Part 3 — The evolution loop
+## Part 3.1 — The evolution loop
 
 ```
 python run.py \
@@ -201,11 +216,21 @@ python run.py \
 ┌────────────────────────────────────────────────────────────────────────┐
 │ STEP 3: Mutation instruction                                           │
 │   IslandManager.mutation_instruction_for(island, iteration)            │
-│   Returns one of 4 variants for "agent_scheduler":                     │
+│                                                                        │
+│   Iterations 0, 1, 2 → bootstrap instructions (3 diverse families):   │
+│     0: DAG-DP — forward pass, cost(v,c) = Σ max(0,c−assigned[u])×bw  │
+│     1: stage-load balancer — equalize node count per stage             │
+│     2: two-pass critical-path-first — zero-mobility ASAP, rest ALAP   │
+│                                                                        │
+│   Iterations 3+ → rotating variants for "agent_scheduler":            │
 │     0: register-pressure-aware list scheduler                          │
 │     1: ASAP-first heuristic with delay-model tie-breaking              │
 │     2: mobility-driven greedy                                          │
 │     3: deterministic multistage heuristic with lookahead               │
+│                                                                        │
+│   All instructions append _RUNTIME_WARNING: complexity constraint      │
+│   reminding the AI about sha256's ~800 IR nodes, 30-min timeout,      │
+│   3600s penalty, and O(n×W) algorithm requirement.                     │
 │   All variants name real XLS APIs only.                                │
 └────────────────────────────────────────────────────────────────────────┘
        │
@@ -250,21 +275,36 @@ python run.py \
 │   5b. builder.backup(target_file)  (writes .bak)                       │
 │       builder.apply(target_file, new_source)                           │
 │                                                                        │
-│   5c. builder.build(                                                   │
-│           XLSBuilder.iteration_targets_for_mode(self.ppa_mode))        │
-│       fast|medium  → agent_generated_scheduler + codegen_main          │
-│                      + opt_main + ir_converter_main                    │
-│       slow|slowest → above + benchmark_main                            │
+│   5c. Build — two stages in slow mode, one in fast:                    │
+│                                                                        │
+│       fast|medium → one combined build step:                           │
+│         "compile:scheduler" target list =                              │
+│           agent_generated_scheduler + codegen_main                     │
+│           + opt_main + ir_converter_main                               │
+│                                                                        │
+│       slow|slowest → two sequential build steps, each timed:          │
+│         "compile:scheduler" = agent_generated_scheduler only           │
+│         "compile:benchmark_main" = benchmark_main (relinks with        │
+│           the new scheduler object)                                    │
+│         on_stage_start/on_stage callbacks fired for each step so the   │
+│         console shows which compile is running and how long it took.   │
 │                                                                        │
 │   5d. If build fails (C++ compile error):                              │
 │       - restore the .bak                                               │
-│       - run.py trims compiler output to the first ~30 error/note lines │
-│         and feeds it back as `compile_error` for a retry               │
-│         (default max_build_retries=3).                                 │
+│       - run.py trims compiler output to up to 60 lines, keeping only  │
+│         lines containing "error:", "warning:", "note:", or "^ "        │
+│         plus one line of context around each match                     │
+│       - trimmed error fed back as `compile_error` for a retry          │
+│         (default max_build_retries=3)                                  │
+│       - each attempt written to iter<N>_island<K>_attempts.log         │
 │                                                                        │
-│   5e. On success: run XLS pipeline on each benchmark design.           │
+│   5e. If build succeeds but pipeline produces no valid PPA             │
+│       (run_failed): break retry loop immediately. run_failed is a      │
+│       runtime outcome, not a code defect — do NOT feed it to the AI.  │
 │                                                                        │
-│   5f. Restore the backup and cleanup.                                  │
+│   5f. On success: run XLS pipeline on each benchmark design.           │
+│                                                                        │
+│   5g. Restore the backup and cleanup.                                  │
 └────────────────────────────────────────────────────────────────────────┘
        │
        ▼
@@ -316,7 +356,151 @@ python run.py \
 
 ---
 
-## Part 3.5 — Compile failure and retry loop
+## Part 3.2 — How the AI is prompted
+
+Here's the complete call chain, file by file:
+
+---
+
+### High-level flow
+
+```
+run.py
+  └─ sampler.sample(...)          # builds the prompt, picks backend
+       └─ Sampler._call_codex()   # shells out to the `codex` CLI
+            └─ codex exec -m gpt-5.4 --sandbox read-only --ephemeral -o /tmp/... -
+                 (prompt piped via stdin)
+                 (model response written to -o file)
+       └─ Sampler._extract_cpp()  # strips markdown fences if any
+  └─ evaluator.evaluate(generated_code)
+```
+
+---
+
+### Step-by-step, with the exact code
+
+#### 1. `run.py` — calls `sampler.sample()` once per attempt
+
+```python
+# run.py  ~line 530
+generated_code = sampler.sample(
+    mutation_target=mutation_type,          # "agent_scheduler"
+    mutation_instruction=mutation_instruction,  # the bootstrap or rotation instruction
+    current_source=current_source,          # current .cc file text
+    reference_source_bundle=...,           # other XLS scheduler sources for API context
+    best_score=best_score,                 # best PPA seen so far (or None)
+    best_num_stages=parent_stages,
+    ...
+    compile_error=last_compile_error,       # None on first attempt; clang error on retry
+    target_file_path=target_file_rel,
+)
+```
+
+`sampler.sample()` returns a raw C++ string. That string goes directly into `evaluator.evaluate()`.
+
+---
+
+#### 2. `alphaevolve/sampler.py` — builds the prompt then shells out
+
+**`sample()` renders the Jinja2 template:**
+```python
+# sampler.py  ~line 79
+template = self._jinja.get_template("implement_agent_scheduler.txt")
+user_prompt = template.render(
+    mutation_instruction=mutation_instruction,
+    current_source=current_source,
+    compile_error=compile_error,        # injected into == PREVIOUS ATTEMPT FAILED ==
+    ...
+)
+```
+
+**`_call_codex()` shells out to the CLI:**
+```python
+# sampler.py  ~line 143
+full_prompt = (
+    f"{self._system_prompt}\n\n"
+    f"{user_prompt}\n\n"
+    "CRITICAL: Your ENTIRE response must be valid C++ source code only. ..."
+)
+
+result = subprocess.run(
+    [
+        "codex", "exec",
+        "-m", self.model,           # e.g. "gpt-5.4"
+        "--sandbox", "read-only",   # pure text generation, no shell allowed
+        "--skip-git-repo-check",
+        "--ephemeral",              # don't persist session files
+        "-o", str(output_file),     # write model's last message to this file
+        "-",                        # read prompt from stdin
+    ],
+    input=full_prompt,
+    capture_output=True,
+    text=True,
+    timeout=300,
+)
+
+# Read the output file (the model's response)
+if output_file.exists() and output_file.stat().st_size > 0:
+    return output_file.read_text(encoding="utf-8")
+```
+
+The `-o` flag is key — `codex exec` writes the model's final response text directly to a file, so there's no stdout scraping needed.
+
+**`_extract_cpp()` strips fences if the model wrapped output anyway:**
+```python
+m = re.search(r"```(?:cpp|c\+\+)?\s*\n(.*?)```", raw, re.DOTALL)
+return m.group(1).strip() if m else raw.strip()
+```
+
+---
+
+#### 3. `alphaevolve/prompts/system.txt` + `implement_agent_scheduler.txt` — what the model actually sees
+
+The prompt has two parts concatenated:
+
+| Part | Source | Content |
+|------|--------|---------|
+| System prompt | `prompts/system.txt` | Role description — "you are an expert C++ compiler/HLS engineer" |
+| User prompt | `prompts/implement_agent_scheduler.txt` (Jinja2) | Task, current PPA score, mutation instruction, current scheduler source, reference XLS API sources, output rules, and optionally the compiler error from the last attempt |
+
+The compile-error injection at the bottom of the template:
+```jinja2
+{% if compile_error %}
+== PREVIOUS ATTEMPT FAILED TO COMPILE ==
+Compiler output:
+{{ compile_error }}
+
+Fix every compiler issue before writing the next version.
+{% endif %}
+```
+
+---
+
+#### 4. Back in `run.py` — what happens to the returned string
+
+```
+sampler.sample() → raw C++ string
+  → evaluator.evaluate(generated_code=...)
+      → evaluator._sanitize_generated_code()   # strips #include, namespace wrappers
+      → evaluator._splice_function()            # replaces the body in the .cc file
+      → builder.build()                         # bazel build → compile
+      → pipeline.run()                          # ir → opt → benchmark → codegen
+```
+
+---
+
+### Key design decisions
+
+- **No API key in the codex path** — `codex exec` uses the session auth that was set up when the user ran `codex` interactively. No `OPENAI_API_KEY` environment variable is needed (though it's passed if present).
+- **`--sandbox read-only`** — prevents the model from executing shell commands; it only generates text.
+- **`--ephemeral`** — no conversation history is persisted across calls. Each `sampler.sample()` is a fresh, independent request.
+- **`-o <file>` not stdout** — the CLI's own progress/logging goes to stdout; the model output goes to a separate temp file, so there's no mixing to parse.
+- **300s timeout on the codex CLI call** — separate from the 1800s XLS build timeout.
+- **OpenAI SDK fallback** — `--backend openai` uses `Sampler._call_openai()` with the Python SDK directly, going through `OPENAI_API_KEY`. The prompt content is identical.
+
+---
+
+## Part 3.3 — Compile failure and retry loop
 
 This section explains exactly what happens when the AI generates C++ that does not compile, what gets fed back, and how the loop decides to retry or give up.
 
@@ -330,16 +514,24 @@ for attempt in 1 .. max_build_retries:
     generated_code = sampler.sample(..., compile_error=last_compile_error)
     result         = evaluator.evaluate(..., generated_code=generated_code)
 
-    if result.candidate.build_status == "success":
-        break                     # compiled → exit retry loop
+    # Write attempt record to disk immediately (preserves all retries)
+    append iter<N>_island<K>_attempts.log with attempt/status/notes
 
-    last_compile_error = trim(result.candidate.notes)
+    if result.candidate.build_status == "success":
+        break                     # compiled and ran → exit retry loop
+
+    if result.candidate.build_status == "run_failed":
+        break                     # compiled but no valid PPA — do NOT retry
+
+    last_compile_error = trim(result.candidate.notes)   # build_failed only
 
 # record whichever result came last (even if build_failed)
 ```
 
 On attempt 1, `compile_error=None` — the prompt does not mention a previous failure.
 On attempts 2 and 3, `compile_error` is the trimmed Clang output from the previous attempt.
+`run_failed` exits the retry loop immediately — it is a runtime outcome (infeasible schedule,
+timeout, proc design in fast mode) and the AI cannot fix it by changing C++ syntax.
 
 ### What gets trimmed and passed back
 
@@ -347,13 +539,20 @@ On attempts 2 and 3, `compile_error` is the trimmed Clang output from the previo
 `run.py` filters it before handing it to the AI:
 
 ```python
-error_lines = [l for l in stderr.splitlines() if "error:" in l or "note:" in l]
-last_compile_error = "\n".join(error_lines[:30])
+# Keep diagnostic lines and one line of context around each
+kept = []
+for i, line in enumerate(lines):
+    if any(tag in line for tag in ("error:", "warning:", "note:", "^ ")):
+        # one line before + the match + one line after
+        if i > 0: kept.append(lines[i-1])
+        kept.append(line)
+        if i + 1 < len(lines): kept.append(lines[i+1])
+last_compile_error = "\n".join(dict.fromkeys(kept))[:60 lines]
 ```
 
-Only lines containing `error:` or `note:` are kept, capped at 30 lines. This strips
-Bazel progress noise, INFO lines, and long include stacks, leaving the AI with the
-smallest message that still identifies every error location and cause.
+Lines containing `error:`, `warning:`, `note:`, or `^ ` (caret markers) are kept,
+plus one surrounding line for context, deduplicated and capped at 60 lines. This
+includes caret underlines that pin-point the exact character where the error occurred.
 
 The trimmed text is injected into the prompt template under:
 
@@ -383,7 +582,7 @@ The AI sees the file, line, column, and a human-readable description — enough 
 |----------------|---------|----------|
 | `success` | Bazel returned 0; C++ compiled and linked. | — (done) |
 | `build_failed` | Bazel returned non-zero; Clang rejected the AI's C++. | **Yes** — error fed back to AI, up to `max_build_retries` attempts. |
-| `run_failed` | Compiled fine, but no design produced valid PPA in the pipeline (clock period exceeded, proc design in fast mode, scheduler timeout, etc.). | **No** — this is a runtime outcome, not a code defect. The candidate is recorded and the loop moves to the next iteration. |
+| `run_failed` | Compiled fine, but no design produced valid PPA in the pipeline (clock period exceeded, proc design in fast mode, scheduler timeout, etc.). | **No** — this is a runtime outcome, not a code defect. The retry loop exits immediately and moves to the next iteration. |
 
 ### What counts as a build failure vs a run failure
 
@@ -413,6 +612,46 @@ No exception is raised; the run continues normally.
 `evaluator.evaluate()` wraps the backup → apply → build → run sequence in a `try/finally` block. The `finally` always calls `builder.restore(target_file)` regardless of whether a `build_failed`, `run_failed`, `TimeoutExpired`, or any other exception occurred. This ensures `agent_generated_scheduler.cc` is always returned to its baseline state before the next iteration begins.
 
 On startup, `run.py` also checks for a leftover `.bak` file (left by a previous run that was killed before the `finally` could execute) and auto-restores it with a warning.
+
+---
+
+## Part 3.4 — Console output and stage callbacks
+
+The spinner and log lines during an iteration are driven by two callbacks threaded from `run.py` → `evaluator.py` → `pipeline.py`:
+
+```
+on_stage_start(name: str, extra: str = "")
+    Called immediately before a stage begins.
+    run.py: updates the Rich spinner label to "▷ <name>  (<extra>)".
+    Also appends "START  <name>  (<extra>)" to the stages.log file.
+
+on_stage(name: str, status: str, duration_s: float, extra: str = "")
+    Called immediately after a stage completes.
+    run.py: prints a timed line "[✓/✗] <name>  <duration_s>s" above the spinner.
+    Also appends "END    <name>  <status>  <duration_s>s" to stages.log.
+```
+
+Stage names visible on the console (in order for a slow-mode run):
+
+| Stage name             | When shown                                           |
+| ---------------------- | ---------------------------------------------------- |
+| `compile:scheduler`    | Bazel compiling `agent_generated_scheduler`          |
+| `compile:benchmark_main` | Bazel relinking `benchmark_main` (slow mode only)  |
+| `[<stem>] ir_convert`  | `ir_converter_main` for each design                  |
+| `[<stem>] opt_main`    | `opt_main` for each design                           |
+| `[<stem>] AI scheduler`| `benchmark_main` executing the AI's C++ code         |
+| `[<stem>] codegen`     | `codegen_main` (fast mode only)                      |
+
+The `[<stem>]` prefix is added automatically when multiple designs are being evaluated, so the user can tell which design each stage belongs to. With a single design the prefix is omitted.
+
+After each stage the spinner resets to "waiting for next stage..." until the next `on_stage_start` fires.
+
+The success line printed after a completed iteration shows all score components:
+
+```
+✓ stages=<N>  area=<A>um²  delay=<D>ps  regs=<R>  runtime=<T>s  score=<S>  | build=<B>s
+    score = <N>×200 + <A>×1 + <D>×1 + <T>×1 = <S>
+```
 
 ---
 
@@ -476,23 +715,25 @@ With `--scheduling_strategy=agent`, codegen_main calls `AgentGeneratedScheduler(
 
 ## Part 5 — `--ppa_mode` matrix
 
-| Mode      | Runs benchmark_main?               | Runs codegen_main? | Proc design support? | Score terms non-zero         | Status      |
-| --------- | ---------------------------------- | ------------------ | -------------------- | ----------------------------- | ----------- |
-| `fast`    | No                                 | Yes (required)     | **No**               | stages, pipeline_reg_bits     | Implemented |
-| `medium`  | No (planned: Yosys synth+stat)     | Yes                | No                   | stages, reg_bits, gate_count  | Placeholder |
-| `slow`    | Yes (built at startup, runs each iter) | Yes (non-fatal fail OK) | **Yes**     | stages, reg_bits, area, delay | Implemented |
-| `slowest` | No (planned: Yosys+OpenROAD)       | Yes                | No                   | stages, reg_bits, silicon area, WNS | Placeholder |
+| Mode      | Per-iteration build targets                              | Runs benchmark_main? | Runs codegen_main per iter? | Proc support? | Score terms non-zero                           | Status      |
+| --------- | -------------------------------------------------------- | -------------------- | --------------------------- | ------------- | ---------------------------------------------- | ----------- |
+| `fast`    | agent_scheduler + codegen_main + opt_main + ir_converter | No                   | Yes (required)              | **No**        | stages, pipeline_reg_bits                      | Implemented |
+| `medium`  | same as fast (Yosys planned)                             | No                   | Yes                         | No            | stages, reg_bits, gate_count (planned)         | Placeholder |
+| `slow`    | agent_scheduler + benchmark_main only                    | Yes, each iter       | **No** (built at startup)   | **Yes**       | stages, reg_bits, area, delay, runtime_s       | Implemented |
+| `slowest` | same as slow (Yosys+OpenROAD planned)                    | Yes                  | **No**                      | No            | stages, reg_bits, silicon area, WNS (planned)  | Placeholder |
+
+Key difference in `slow` mode: `codegen_main` is **not** included in the per-iteration build targets. It is built once at startup (during the initial binary probe). This avoids relinking it on every iteration — `benchmark_main` alone provides all needed PPA metrics in slow mode.
 
 Implementation references:
 
 - `xls_tools/build.py :: XLSBuilder.iteration_targets_for_mode(mode)`
-  Adds `//xls/dev_tools:benchmark_main` when `mode in ("slow", "slowest")`.
-- `xls_tools/pipeline.py :: XLSPipeline.run(..., ppa_mode=...)`
-  Gates the `benchmark_main` subprocess on the same condition, and treats codegen failure as non-fatal in slow mode when benchmark_main produced metrics.
+  Returns `[agent_generated_scheduler, benchmark_main]` for slow/slowest; includes codegen_main + helpers for fast/medium.
+- `xls_tools/pipeline.py :: XLSPipeline.run(..., ppa_mode=..., benchmark_timeout=...)`
+  Gates the `benchmark_main` subprocess on mode; treats codegen failure as non-fatal in slow mode when benchmark_main produced metrics.
 - `alphaevolve/evaluator.py :: Evaluator.__init__(..., ppa_mode="fast")`
   Stores the mode and threads it into both `builder.build(...)` and `pipeline.run(...)`.
 - `run.py :: parse_args()`
-  Declares `--ppa_mode {fast,medium,slow,slowest}` and validates the resolved value.
+  Declares `--ppa_mode {fast,medium,slow,slowest}` and `--benchmark_timeout N` (default 1800).
 
 Placeholder modes emit a warning to stderr and then evaluate as if `fast`, so the loop keeps making progress.
 
@@ -501,26 +742,30 @@ Placeholder modes emit a warning to stderr and then evaluate as if `fast`, so th
 ## Part 6 — Scoring
 
 ```
-Score = num_stages        * stage_weight
-      + pipeline_flops    * power_weight
-      + area_um2          * area_weight
-      + critical_path_ps  * delay_weight
+Score = num_stages          * stage_weight
+      + pipeline_flops      * flop_weight
+      + area_um2            * area_weight
+      + critical_path_ps    * delay_weight
+      + scheduler_runtime_s * runtime_weight
 ```
 
-Lower is better. Defaults from `configs/evolve_config.yaml`:
+Lower is better. Defaults from `configs/evolve_config.yaml` (and `alphaevolve/ppa_metrics.py`):
 
-| Weight         | Default | Notes                                                                                 |
-| -------------- | ------- | ------------------------------------------------------------------------------------- |
-| `stage_weight` | 200     | Pipeline depth is the primary signal — always meaningful across all modes.            |
-| `power_weight` | 0       | Pipeline flop bits as a proxy for switching-power cost. Off by default.               |
-| `reg_weight`   | 1       | Deprecated alias for `power_weight`. Still read for backward compatibility.           |
-| `area_weight`  | 1       | Only meaningful with `ppa_mode=slow` (area comes from asap7). Otherwise area=0.       |
-| `delay_weight` | 1       | Critical-path picoseconds.                                                            |
+| Weight           | Default | Notes                                                                                        |
+| ---------------- | ------- | -------------------------------------------------------------------------------------------- |
+| `stage_weight`   | 200     | Pipeline depth is the primary signal — always meaningful across all modes.                   |
+| `flop_weight`    | 0       | Pipeline flop bits as a proxy for switching-power cost. Off by default.                      |
+| `area_weight`    | 1       | Only meaningful with `ppa_mode=slow` (area comes from asap7 model). Otherwise area=0.        |
+| `delay_weight`   | 1       | Critical-path picoseconds from benchmark_main (slow) or block_metrics (fast).                |
+| `runtime_weight` | 1       | Scheduler wall-clock execution time in seconds, measured by benchmark_main. Only active in slow mode. A scheduler that times out (killed after `--benchmark_timeout` seconds) receives `runtime_s=3600` as a penalty, regardless of the actual timeout duration. This penalises O(n²) algorithms that would eventually produce valid PPA but are too slow to be useful. |
+
+`scheduler_runtime_s` is stored in `PPAMetrics.scheduler_runtime_s` and in the `Candidate` row. The `configure_scoring()` function in `ppa_metrics.py` lets the caller override any weight for the current process.
 
 Aggregation across multiple designs (`evaluator._run_pipeline_on_designs`):
 
 - `total_stages`, `total_flops`, `total_area` are **summed** across designs.
-- `max_delay` and `max_min_clock` are the **maximum** across designs.
+- `max_delay`, `max_min_clock`, and `max_runtime_s` are the **maximum** across designs.
+  (`max_runtime_s` uses the worst scheduler runtime across all designs, since the slowest design determines whether the iteration is practical.)
 
 ---
 
@@ -532,15 +777,25 @@ results/<timestamp>/
 ├── evolution_log.csv           Flat CSV of every candidate (for plotting).
 ├── ppa_report.json             Final summary with the top 3 candidates.
 ├── best_algorithm.patch        Unified diff against the baseline scheduler.
-└── eval_runs/iter<NNNN>_island<K>/
-    └── <design>/
-        ├── <design>.ir                    after ir_converter_main
-        ├── <design>_opt.ir                after opt_main
-        ├── <design>_block_metrics.textproto   codegen_main (when it succeeds)
-        ├── <design>_schedule.textproto        codegen_main (when it succeeds)
-        ├── <design>.v                         codegen_main (when it succeeds)
-        └── <design>_benchmark.txt             benchmark_main (slow modes); or
-                                               "benchmark_main skipped" in fast mode
+└── eval_runs/
+    ├── iter<NNNN>_island<K>_stages.log   Real-time stage log written as each XLS
+    │                                     stage starts and completes. Written by the
+    │                                     on_stage_start / on_stage callbacks in run.py.
+    │                                     Use `tail -f` during a slow run to watch
+    │                                     which stage is active and how long each takes.
+    ├── iter<NNNN>_island<K>_attempts.log Per-iteration compile-retry record. One entry
+    │                                     per attempt (attempt number, build status, notes).
+    │                                     Written after every attempt — data from failed
+    │                                     retries is not lost even if the loop continues.
+    └── iter<NNNN>_island<K>/
+        └── <design>/
+            ├── <design>.ir                    after ir_converter_main
+            ├── <design>_opt.ir                after opt_main
+            ├── <design>_block_metrics.textproto   codegen_main (when it succeeds)
+            ├── <design>_schedule.textproto        codegen_main (when it succeeds)
+            ├── <design>.v                         codegen_main (when it succeeds)
+            └── <design>_benchmark.txt             benchmark_main (slow modes); or
+                                                   "benchmark_main skipped" in fast mode
 ```
 
 ---

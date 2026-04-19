@@ -38,6 +38,16 @@ Runtime expectations:
 - prefer roughly single-pass topological scheduling with bounded per-node candidate scoring
 - be careful with repeated expensive recomputation after every choice
 
+== HARDWARE CONSTRAINTS ==
+Clock period:    {{ clock_period_ps }} ps  (each pipeline stage must fit within this budget)
+Pipeline stages: {% if pipeline_stages is not none %}{{ pipeline_stages }} (FIXED — you MUST distribute nodes across exactly {{ pipeline_stages }} stages){% else %}not fixed — let clock period and bounds determine the stage count{% endif %}
+
+Delay model: unit delay means each node contributes 1 ps.
+With clock_period={{ clock_period_ps }} ps and unit model, up to {{ clock_period_ps }} nodes can fit in
+one stage. If you schedule everything in 1 stage your score is dominated by area+delay,
+not by stage count — but pipelining reduces area and timing pressure, so consider spreading
+nodes across stages even when the clock allows fitting them all in one stage.
+
 == CURRENT PPA SCORE ==
 {% if best_score is not none %}
 Best score so far: {{ best_score | int }} (lower is better)
@@ -106,6 +116,48 @@ Compile-safety guidance:
   a final `ScheduleCycleMap`.
 - If retrying after a compiler failure, fix the specific C++ issue first and only
   then change algorithm details.
+
+== CRITICAL API PATTERNS — MEMORISE THESE OR YOUR CODE WILL NOT COMPILE ==
+
+// ──────────────────────────────────────────────────────────────
+// TopoSort — MOST COMMON COMPILE ERROR
+// TopoSort(f) returns absl::StatusOr<std::vector<Node*>>, NOT a vector.
+// You MUST unwrap it with XLS_ASSIGN_OR_RETURN before iterating.
+// ──────────────────────────────────────────────────────────────
+
+// ✓ CORRECT
+XLS_ASSIGN_OR_RETURN(std::vector<Node*> nodes, TopoSort(f));
+for (Node* node : nodes) { /* ... */ }
+
+// ✗ COMPILE ERROR — do NOT write this:
+for (Node* node : TopoSort(f)) { /* WRONG: StatusOr is not iterable */ }
+
+// ──────────────────────────────────────────────────────────────
+// bounds methods — all return absl::Status; you MUST check them
+// ──────────────────────────────────────────────────────────────
+
+XLS_RETURN_IF_ERROR(bounds->TightenNodeLb(node, cycle));
+XLS_RETURN_IF_ERROR(bounds->TightenNodeUb(node, cycle));
+XLS_RETURN_IF_ERROR(bounds->PropagateBounds());
+
+// ──────────────────────────────────────────────────────────────
+// delay_estimator — returns StatusOr; use helper pattern
+// ──────────────────────────────────────────────────────────────
+
+absl::StatusOr<int64_t> d_or = delay_estimator.GetOperationDelayInPs(node);
+int64_t node_delay_ps = d_or.ok() ? d_or.value() : 0;
+
+// ──────────────────────────────────────────────────────────────
+// pipeline_stages — USE THIS, do NOT ignore it with (void)pipeline_stages
+// pipeline_stages is the REQUIRED number of pipeline stages for this design.
+// Your schedule MUST use EXACTLY pipeline_stages cycles (0 … pipeline_stages-1).
+// Ignoring pipeline_stages collapses the design to 1 stage, wasting all
+// pipeline-register reduction potential and scoring poorly.
+// ──────────────────────────────────────────────────────────────
+
+// ✓ Example: use pipeline_stages to spread nodes across stages
+// lb = bounds->lb(node); ub = min(bounds->ub(node), pipeline_stages - 1);
+// Then pick a cycle in [lb, ub] using your scoring heuristic.
 
 {% if compile_error %}
 == PREVIOUS ATTEMPT FAILED TO COMPILE ==

@@ -34,6 +34,7 @@ class BenchmarkOutput:
     min_clock_period_ps: int = 0
     min_stage_slack_ps: int = 0
     num_stages: int = 0                # inferred from stage count in output
+    runtime_s: float = 0.0            # wall-clock seconds benchmark_main ran
     raw_stdout: str = ""
 
 
@@ -69,11 +70,13 @@ class XLSPipeline:
         bazel_bin_dir: Path | str | None = None,
         dslx_stdlib_path: Path | str | None = None,
         tmp_dir: Path | str | None = None,
+        benchmark_timeout: int = 1800,   # seconds; pass --benchmark_timeout from CLI
     ):
         self.prebuilt_bin_dir = Path(prebuilt_bin_dir) if prebuilt_bin_dir else None
         self.bazel_bin_dir = Path(bazel_bin_dir) if bazel_bin_dir else None
         self.dslx_stdlib_path = Path(dslx_stdlib_path) if dslx_stdlib_path else None
         self.tmp_dir = Path(tmp_dir) if tmp_dir else None
+        self.benchmark_timeout = benchmark_timeout
 
         if not self.prebuilt_bin_dir and not self.bazel_bin_dir:
             raise ValueError("Must specify at least one of prebuilt_bin_dir or bazel_bin_dir")
@@ -160,6 +163,12 @@ class XLSPipeline:
         # compatibility with existing callers.
         scheduling_strategy: str | None = None,
         use_benchmark_main: bool | None = None,
+        # Optional callbacks for progress reporting:
+        #   on_stage_start(name, extra)                  — fired before a stage begins
+        #   on_stage(name, status, duration_s, extra)    — fired after a stage ends
+        #   status values: "ok" | "failed" | "skipped" | "timeout" | "no-ppa"
+        on_stage_start=None,
+        on_stage=None,
     ) -> PipelineResult:
         """
         Full DSLX → Verilog + PPA pipeline. Always uses --scheduling_strategy=agent.
@@ -185,6 +194,16 @@ class XLSPipeline:
         block_metrics_path = output_dir / f"{stem}_block_metrics.textproto"
         benchmark_log_path = output_dir / f"{stem}_benchmark.txt"
 
+        import time as _time
+
+        def _notify_start(name: str, extra: str = "") -> None:
+            if on_stage_start is not None:
+                on_stage_start(name, extra)
+
+        def _notify(name: str, status: str, t0: float, extra: str = "") -> None:
+            if on_stage is not None:
+                on_stage(name, status, _time.monotonic() - t0, extra)
+
         def _fail(stage, res):
             return PipelineResult(
                 success=False, verilog_path=None, schedule_path=None,
@@ -204,8 +223,11 @@ class XLSPipeline:
             ir_cmd += [f"--dslx_stdlib_path={self.dslx_stdlib_path}"]
         if dslx_top:
             ir_cmd += [f"--top={dslx_top}"]   # sets package top in the IR
+        _notify_start("ir_convert", dslx_file.name)
+        _t = _time.monotonic()
         result = self._run(ir_cmd)
         if result.returncode != 0:
+            _notify("ir_convert", "failed", _t, dslx_file.name)
             return _fail("ir_convert", result)
 
         ir_text = result.stdout
@@ -213,6 +235,7 @@ class XLSPipeline:
 
         top = self._detect_top(ir_text)
         if not top:
+            _notify("ir_convert", "failed", _t, "no top entity detected")
             return PipelineResult(
                 success=False, verilog_path=None, schedule_path=None,
                 block_metrics_path=None, benchmark_output=None,
@@ -221,23 +244,32 @@ class XLSPipeline:
                 stderr="Could not detect top from IR",
                 error_stage="ir_convert",
             )
+        _notify("ir_convert", "ok", _t, dslx_file.name)
 
         # ── Stage 2: Optimize IR ─────────────────────────────────────────────────
         # Don't pass --top; package top was already set by ir_converter_main.
+        _notify_start("opt_main")
+        _t = _time.monotonic()
         result = self._run([self._require_bin("opt_main"), str(ir_path)])
         if result.returncode != 0:
+            _notify("opt_main", "failed", _t)
             return _fail("opt", result)
         opt_ir_path.write_text(result.stdout, encoding="utf-8")
+        _notify("opt_main", "ok", _t)
 
         # ── Stage 3: benchmark_main → primary PPA report ─────────────────────────
         benchmark_out = None
         bm_bin = self._bin("benchmark_main")
 
-        # benchmark_main with asap7 delay model JIT-compiles a cell library and
-        # runs the scheduler — allow up to 30 minutes for complex designs.
-        _BENCHMARK_TIMEOUT = 1800
+        # benchmark_main runs the AI scheduler on the full IR.
+        # runtime_s is always recorded; timeouts use a 3600s penalty value so
+        # slow schedulers are penalised in scoring even when they produce no PPA.
+        _BENCHMARK_TIMEOUT = self.benchmark_timeout
 
         def _run_benchmark_main() -> BenchmarkOutput | None:
+            """Run benchmark_main. Returns None only when binary is missing.
+            On timeout or no-PPA, returns a BenchmarkOutput with runtime_s set
+            but PPA fields zeroed so the caller can still record the penalty."""
             if bm_bin is None:
                 return None
 
@@ -253,27 +285,51 @@ class XLSPipeline:
             if pipeline_stages is not None:
                 bm_cmd += [f"--pipeline_stages={pipeline_stages}"]
 
+            # Distinct label for the spinner: makes it clear the AI scheduler
+            # is now executing (not just a compilation step).
+            _notify_start(
+                "AI scheduler",
+                f"running in benchmark_main  delay_model={delay_model}  "
+                f"area_model={area_model}  timeout={_BENCHMARK_TIMEOUT}s",
+            )
+            _bt = _time.monotonic()
             try:
                 bm_result = self._run(bm_cmd, timeout=_BENCHMARK_TIMEOUT)
             except subprocess.TimeoutExpired:
+                actual = _time.monotonic() - _bt
                 msg = (
-                    f"benchmark_main timed out after {_BENCHMARK_TIMEOUT}s "
+                    f"benchmark_main timed out after {actual:.0f}s "
                     f"(delay_model={delay_model}, design={opt_ir_path.stem})\n"
                 )
                 benchmark_log_path.write_text(msg, encoding="utf-8")
-                return None
+                _notify("AI scheduler", "timeout", _bt,
+                        f">{_BENCHMARK_TIMEOUT}s  runtime_s=3600 (penalty)")
+                return BenchmarkOutput(runtime_s=3600.0)
 
+            actual = _time.monotonic() - _bt
             bm_text = bm_result.stdout + bm_result.stderr
             benchmark_log_path.write_text(bm_text, encoding="utf-8")
 
             parsed = parse_benchmark_stdout(bm_text)
+            parsed.runtime_s = actual
             if parsed.critical_path_ps > 0 or parsed.num_stages > 0 or "Pipeline:" in bm_text:
                 parsed.raw_stdout = bm_text
+                _notify("AI scheduler", "ok", _bt,
+                        f"delay_model={delay_model}  area_model={area_model}  "
+                        f"runtime={actual:.1f}s")
                 return parsed
-            return None
+            _notify("AI scheduler", "no-ppa", _bt,
+                    f"no Pipeline: section in output  runtime={actual:.1f}s")
+            return parsed  # zeroed PPA but runtime_s is set
+
         if run_benchmark_main and bm_bin:
             benchmark_out = _run_benchmark_main()
         else:
+            reason = (
+                f"ppa_mode={ppa_mode}" if not run_benchmark_main
+                else "binary not built"
+            )
+            _notify("benchmark_main", "skipped", _time.monotonic(), reason)
             message = (
                 f"benchmark_main skipped (ppa_mode={ppa_mode})\n"
                 if not run_benchmark_main
@@ -282,22 +338,43 @@ class XLSPipeline:
             benchmark_log_path.write_text(message, encoding="utf-8")
 
         # ── Stage 4: codegen_main → Verilog + block_metrics ─────────────────────
-        # In slow mode, benchmark_main is the primary PPA source. If it already
-        # produced valid metrics, skip codegen entirely — we don't need Verilog or
-        # block_metrics for scoring, and codegen can time out on complex AI-generated
-        # schedulers (the AI-generated scheduler runs inside codegen too).
-        if benchmark_out is not None and run_benchmark_main:
-            return PipelineResult(
-                success=True,
-                verilog_path=None,
-                schedule_path=None,
-                block_metrics_path=None,
-                benchmark_output=benchmark_out,
-                ir_path=ir_path,
-                top_function=top,
-                stdout="",
-                stderr="codegen_main skipped — benchmark_main PPA already available",
-            )
+        # In slow mode benchmark_main is the sole PPA source.
+        # • If it produced valid metrics → return success immediately.
+        # • If it ran but produced no PPA (timeout / infeasible) → return failure
+        #   but carry benchmark_output so the evaluator can record runtime_s.
+        # codegen_main is never called in slow mode (it's not in the build targets).
+        has_bm_ppa = (
+            benchmark_out is not None
+            and (benchmark_out.critical_path_ps > 0 or benchmark_out.num_stages > 0)
+        )
+        if run_benchmark_main:
+            if has_bm_ppa:
+                _notify("codegen_main", "skipped", _time.monotonic(),
+                        "benchmark_main PPA available")
+                return PipelineResult(
+                    success=True,
+                    verilog_path=None, schedule_path=None,
+                    block_metrics_path=None,
+                    benchmark_output=benchmark_out,
+                    ir_path=ir_path, top_function=top,
+                    stdout="",
+                    stderr="codegen_main skipped — benchmark_main PPA already available",
+                )
+            else:
+                # benchmark ran (or timed out) but produced no usable PPA.
+                # Return failure and carry benchmark_output for runtime recording.
+                _notify("codegen_main", "skipped", _time.monotonic(),
+                        "benchmark_main produced no PPA — skipping codegen in slow mode")
+                return PipelineResult(
+                    success=False,
+                    verilog_path=None, schedule_path=None,
+                    block_metrics_path=None,
+                    benchmark_output=benchmark_out,  # carries runtime_s
+                    ir_path=ir_path, top_function=top,
+                    stdout="",
+                    stderr="benchmark_main produced no PPA (timeout or infeasible schedule)",
+                    error_stage="benchmark",
+                )
 
         # codegen_main runs the delay estimator inline on every node during
         # scheduling — always use 'unit' here regardless of the configured
@@ -322,15 +399,26 @@ class XLSPipeline:
             if pipeline_stages is not None:
                 codegen_cmd += [f"--pipeline_stages={pipeline_stages}"]
 
+        _notify_start("codegen_main", "delay_model=unit")
+        _t = _time.monotonic()
         result = self._run(codegen_cmd)
         # codegen_main failure is non-fatal if benchmark_main already produced PPA.
         # Proc networks (e.g. matmul_4x4) may fail codegen_main's register-reset
         # validation while benchmark_main handles them fine.
         codegen_ok = result.returncode == 0
-        if not codegen_ok and benchmark_out is None and bm_bin is not None:
-            benchmark_out = _run_benchmark_main()
+        if codegen_ok:
+            _notify("codegen_main", "ok", _t, "delay_model=unit")
+        else:
+            _notify("codegen_main", "failed", _t,
+                    result.stderr.splitlines()[-1] if result.stderr.strip() else "")
+        # In slow mode codegen_main is not in the per-iteration build targets so
+        # the binary may reflect a previous iteration's scheduler — do not use it
+        # as a PPA fallback.  fast/medium mode has no benchmark_main at all, so
+        # codegen_main is the only source of PPA; fallback there is appropriate.
+        if not codegen_ok and benchmark_out is None and not run_benchmark_main:
+            benchmark_out = _run_benchmark_main()   # fast/medium only
         if not codegen_ok and benchmark_out is None:
-            return _fail("codegen", result)   # no PPA at all → hard fail
+            return _fail("codegen", result)
 
         return PipelineResult(
             success=True,

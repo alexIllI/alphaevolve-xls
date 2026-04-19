@@ -75,15 +75,20 @@ class XLSBuilder:
     def iteration_targets_for_mode(cls, ppa_mode: str) -> list[str]:
         """
         Return the per-iteration rebuild list for the chosen PPA mode.
-            fast / medium : agent scheduler + codegen_main (no benchmark_main).
-            slow          : include benchmark_main so asap7 metrics refresh.
-            slowest       : currently same as slow (Yosys/OpenROAD happen
-                            outside Bazel).
+            fast / medium : agent_scheduler + codegen_main only.
+            slow / slowest: agent_scheduler + benchmark_main only.
+                            codegen_main is intentionally excluded — in slow
+                            mode benchmark_main is the sole PPA source and
+                            codegen is never called.  Building codegen_main
+                            on top of benchmark_main adds ~15s of link time
+                            per iteration for no benefit.
         """
-        base = list(cls.AGENT_ITERATION_TARGETS)
         if ppa_mode in ("slow", "slowest"):
-            base.extend(cls.BENCHMARK_TARGETS)
-        return base
+            return [
+                "//xls/scheduling:agent_generated_scheduler",
+                "//xls/dev_tools:benchmark_main",
+            ]
+        return list(cls.AGENT_ITERATION_TARGETS)  # agent_scheduler + codegen_main
 
     def __init__(
         self,

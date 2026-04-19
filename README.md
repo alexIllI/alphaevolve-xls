@@ -292,6 +292,13 @@ Paths:
   --xls_src PATH            XLS source clone    (default: $XLS_SRC_PATH or /mnt/d/final/xls).
   --xls_prebuilt PATH       Optional pre-built binary directory fallback.
 
+Timing:
+  --benchmark_timeout N     Seconds before benchmark_main is killed per design.
+                            Default: 1800 (30 min). A timed-out run records
+                            runtime_s=3600 as a score penalty so slow schedulers
+                            rank below fast ones with similar PPA.
+                            Only relevant with --ppa_mode slow.
+
 Other:
   --dry_run                 Validate the full pipeline without calling the AI.
                             Uses the ASAP stub scheduler inside agent_generated_scheduler.cc.
@@ -304,16 +311,28 @@ Other:
 
 ## `--ppa_mode` — How it changes the loop
 
-| Mode      | PPA source                              | Needs `benchmark_main`? | Per-iter cost   | Works with proc designs? | Status                   |
-| --------- | --------------------------------------- | ----------------------- | --------------- | ------------------------ | ------------------------ |
-| `fast`    | `codegen_main --block_metrics_path`     | No                      | ~30–90 s        | **No**                   | Implemented (default)    |
-| `medium`  | `yosys -p "synth; stat"` on the Verilog | No                      | ~15–60 s extra  | No                       | Placeholder (falls back) |
-| `slow`    | `benchmark_main` with `asap7` area      | Yes — built at startup  | ~5–10 min extra | **Yes**                  | Implemented              |
-| `slowest` | Yosys `synth_asap7` + OpenROAD PnR      | No (Yosys/OpenROAD)     | ~5–15 min extra | No                       | Placeholder (falls back) |
+| Mode      | PPA source                              | Needs `benchmark_main`? | Per-iter build targets                           | Works with proc designs? | Status                   |
+| --------- | --------------------------------------- | ----------------------- | ------------------------------------------------ | ------------------------ | ------------------------ |
+| `fast`    | `codegen_main --block_metrics_path`     | No                      | `agent_generated_scheduler` + `codegen_main` + `opt_main` + `ir_converter_main` | **No** | Implemented (default) |
+| `medium`  | `yosys -p "synth; stat"` on the Verilog | No                      | same as fast                                    | No                       | Placeholder (falls back) |
+| `slow`    | `benchmark_main` with `asap7` area      | Yes — built at startup  | `agent_generated_scheduler` + `benchmark_main` only (codegen_main not rebuilt per iteration) | **Yes** | Implemented |
+| `slowest` | Yosys `synth_asap7` + OpenROAD PnR      | No (Yosys/OpenROAD)     | same as slow                                    | No                       | Placeholder (falls back) |
 
 Placeholder modes emit a warning and evaluate as if the mode were `fast`.
 
-Score weights (`stage_weight`, `reg_weight`, `area_weight`, `delay_weight`) live in `configs/evolve_config.yaml`. Lower scores are better. In `fast` mode the area term is zero (codegen does not emit absolute silicon area); scoring is dominated by stages and register bits.
+Score weights (`stage_weight`, `reg_weight`, `area_weight`, `delay_weight`, `runtime_weight`) live in `configs/evolve_config.yaml`. Lower scores are better. In `fast` mode the area term is zero (codegen does not emit absolute silicon area); scoring is dominated by stages and register bits.
+
+The score formula is:
+
+```
+score = num_stages        × stage_weight   (default 200)
+      + pipeline_flops    × flop_weight    (default 0)
+      + area_um²          × area_weight    (default 1)
+      + critical_path_ps  × delay_weight   (default 1)
+      + scheduler_runtime_s × runtime_weight (default 1)
+```
+
+Scheduler execution time is measured by `benchmark_main`'s wall clock. A scheduler that times out records `runtime_s = 3600` regardless of the actual timeout setting, imposing a large penalty to discourage O(n²) or worse algorithms. This is only active in `--ppa_mode slow` where `benchmark_main` actually runs.
 
 ---
 
@@ -339,19 +358,38 @@ Per iteration:
               baseline benchmark context.
   --- Compile-retry loop (default max_build_retries=3) ---
   4. Splice the generated C++ into xls/scheduling/agent_generated_scheduler.cc.
-  5. Incremental Bazel build of the agent_scheduler target + its reverse deps.
-     Compile failure: send the exact clang errors back to the AI and retry.
+  5. Incremental Bazel build:
+       fast/medium → compile:scheduler  (agent_generated_scheduler + codegen_main + helpers)
+                     (single combined step)
+       slow        → compile:scheduler  (agent_generated_scheduler only), then
+                     compile:benchmark_main  (relinks benchmark_main; shown as separate
+                     timed line on the console)
+     Compile failure: trim errors to ~60 lines (error:, warning:, note:, ^ lines),
+     send back to AI and retry. run_failed does NOT retry — it records the candidate
+     and moves to the next iteration immediately.
   6. Run the XLS pipeline on every benchmark design:
-       DSLX → IR → opt → codegen  (+ benchmark_main if ppa_mode=slow).
+       DSLX → IR → opt → benchmark_main (slow: runs the AI scheduler, tracked as
+                          "AI scheduler" on the console) → codegen (fast only)
   7. Extract PPA (block_metrics in fast, benchmark_main stdout in slow).
-  8. Score = stages*stage_weight + flop_bits*reg_weight + area*area_weight + delay*delay_weight.
+  8. Score = stages×stage_weight + flops×flop_weight + area×area_weight
+           + delay×delay_weight + runtime_s×runtime_weight.
   9. Insert candidate in SQLite; update island.
  10. If score improved, write results/<run>/best_algorithm.patch.
  11. Restore the original agent_generated_scheduler.cc.
  12. Every migration_interval iterations: copy global best into all islands.
 ```
 
-The AI always sees four rotating instruction "variants" per island: register-pressure-aware, ASAP-with-tie-break, mobility-driven, and lookahead. All four reference only real APIs (`TopoSort`, `IsUntimed`, `bounds->lb/ub`, `TightenNodeLb/Ub`, `PropagateBounds`, `delay_estimator.GetOperationDelayInPs`, `node->operands()`, `node->users()`, `GetFlatBitCount`).
+The first three iterations (0, 1, 2) always use **bootstrap instructions** — three maximally-diverse algorithmic families designed to seed the PPA search with distinct design points before evolution begins:
+
+| Bootstrap | Algorithm | Strategy |
+|-----------|-----------|----------|
+| 0 | DAG-DP scheduler | Single forward pass in TopoSort order; `cost(v,c) = Σ max(0, c−assigned_cycle[u]) × bitwidth(u)` over operands. Minimizes total pipeline-register pressure in O(n×W). |
+| 1 | Stage-load balancer | Assigns each node to the least-loaded stage, producing a flat histogram of nodes per stage. |
+| 2 | Critical-path-first two-pass | Pass 1 schedules zero-mobility (critical) nodes ASAP; Pass 2 pushes all others ALAP. |
+
+From iteration 3 onwards, four rotating **variants** take over: register-pressure-aware, ASAP-with-tie-break, mobility-driven, and lookahead. All instructions include an explicit **complexity warning** about the sha256 benchmark's ~800 IR nodes, the 30-minute timeout, and the 3600s runtime penalty — requiring O(n×W) algorithms and banning O(n²) inner loops.
+
+All variants reference only real APIs (`TopoSort`, `IsUntimed`, `bounds->lb/ub`, `TightenNodeLb/Ub`, `PropagateBounds`, `delay_estimator.GetOperationDelayInPs`, `node->operands()`, `node->users()`, `GetFlatBitCount`).
 
 ---
 
@@ -421,13 +459,15 @@ Other per-design constraints (fixed `pipeline_stages`, alternate `generator`) ca
 
 Every run creates a directory under `--output_dir` (or `results/<timestamp>/` by default) containing:
 
-| File                   | Contents                                                          |
-| ---------------------- | ----------------------------------------------------------------- |
-| `best_algorithm.patch` | Unified diff of `agent_generated_scheduler.cc` for the best score |
-| `ppa_report.json`      | Final PPA summary + top 3 candidates                              |
-| `evolution_log.csv`    | One row per candidate (score, status, timings, diff sizes)        |
-| `candidates_db.sqlite` | Full candidate database (code, diffs, all metrics)                |
-| `eval_runs/iterXXXX_*` | Per-design IR, schedule, block_metrics, Verilog, benchmark output |
+| File                                        | Contents                                                                      |
+| ------------------------------------------- | ----------------------------------------------------------------------------- |
+| `best_algorithm.patch`                      | Unified diff of `agent_generated_scheduler.cc` for the best score             |
+| `ppa_report.json`                           | Final PPA summary + top 3 candidates                                          |
+| `evolution_log.csv`                         | One row per candidate (score, status, timings, diff sizes)                    |
+| `candidates_db.sqlite`                      | Full candidate database (code, diffs, all metrics)                            |
+| `eval_runs/iter<N>_island<K>_stages.log`    | Real-time stage log; updated as each XLS stage starts and completes. `tail -f` during a slow run to watch progress. |
+| `eval_runs/iter<N>_island<K>_attempts.log`  | Per-attempt record for this iteration: attempt number, build status, notes. Preserves data from all retries, not just the last. |
+| `eval_runs/iter<N>_island<K>/<design>/`     | Per-design IR, schedule, block_metrics, Verilog, benchmark output             |
 
 Apply the best result permanently:
 

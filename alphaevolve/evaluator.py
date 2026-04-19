@@ -77,6 +77,8 @@ class Evaluator:
         parent_id: int | None,
         mutation_type: str,
         generated_code: str,
+        on_stage_start=None,  # optional Callable[[name, extra], None] — fired before stage
+        on_stage=None,        # optional Callable[[name, status, duration_s, extra], None]
     ) -> EvalResult:
         """
         Run a full evaluation of a generated C++ algorithm variant.
@@ -119,9 +121,38 @@ class Evaluator:
 
         try:
             # ── Build ─────────────────────────────────────────────────────────
-            build_result = self.builder.build(
-                XLSBuilder.iteration_targets_for_mode(self.ppa_mode)
-            )
+            # In slow mode: compile the scheduler .cc first, then relink
+            # benchmark_main as a separate step — each gets its own timed line.
+            # In fast/medium: one combined build (no benchmark_main involved).
+            slow_mode = self.ppa_mode in ("slow", "slowest")
+            if slow_mode:
+                scheduler_targets = ["//xls/scheduling:agent_generated_scheduler"]
+                benchmark_targets = ["//xls/dev_tools:benchmark_main"]
+            else:
+                scheduler_targets = XLSBuilder.iteration_targets_for_mode(self.ppa_mode)
+                benchmark_targets = []
+
+            def _build_stage(label: str, targets: list[str]) -> "BuildResult":
+                if on_stage_start is not None:
+                    on_stage_start(label, targets[0].split(":")[-1])
+                r = self.builder.build(targets)
+                if on_stage is not None:
+                    on_stage(label, "ok" if r.success else "failed",
+                             r.duration_seconds, "")
+                return r
+
+            build_result = _build_stage("compile:scheduler", scheduler_targets)
+
+            if build_result.success and benchmark_targets:
+                bm_build = _build_stage("compile:benchmark_main", benchmark_targets)
+                if not bm_build.success:
+                    # Merge stderr so callers see the failure reason.
+                    from dataclasses import replace as _dc_replace
+                    build_result = _dc_replace(
+                        bm_build,
+                        duration_seconds=build_result.duration_seconds + bm_build.duration_seconds,
+                    )
+
             if not build_result.success:
                 # Store the full stderr — truncation happens in run.py when
                 # the error is fed back to the AI (where brevity matters).
@@ -134,7 +165,9 @@ class Evaluator:
             else:
                 # ── Run XLS pipeline on all benchmark designs ─────────────────
                 aggregate_ppa, error_msg = self._run_pipeline_on_designs(
-                    iteration, island_id
+                    iteration, island_id,
+                    on_stage_start=on_stage_start,
+                    on_stage=on_stage,
                 )
         finally:
             # Always restore — even if build or pipeline throws (e.g. TimeoutExpired)
@@ -181,6 +214,8 @@ class Evaluator:
         self,
         iteration: int,
         island_id: int,
+        on_stage_start=None,
+        on_stage=None,
     ) -> tuple[PPAMetrics, str]:
         """
         Run the XLS pipeline on all benchmark designs and aggregate PPA.
@@ -199,14 +234,29 @@ class Evaluator:
         total_area   = 0.0
         max_delay    = 0
         max_min_clock = 0
+        max_runtime_s = 0.0   # worst scheduler runtime across all designs
         any_feasible = False
         timeout_errors: list[str] = []
 
         per_design_overrides = self.ppa_constraints.get("per_design", {})
+        n_designs = len(self.design_files)
         for design in self.design_files:
             cstr = {**self.ppa_constraints, **per_design_overrides.get(design.stem, {})}
             run_dir = self.output_dir / f"iter{iteration:04d}_island{island_id}" / design.stem
+
+            # Prefix stage names with the design stem when running multiple designs
+            # so the caller can tell which stage belongs to which design.
+            def _design_stage(name, status, dur, extra, _stem=design.stem):
+                if on_stage is not None:
+                    label = f"[{_stem}] {name}" if n_designs > 1 else name
+                    on_stage(label, status, dur, extra)
+
             try:
+                def _design_stage_start(name, extra, _stem=design.stem):
+                    if on_stage_start is not None:
+                        label = f"[{_stem}] {name}" if n_designs > 1 else name
+                        on_stage_start(label, extra)
+
                 result = self.pipeline.run(
                     dslx_file=design,
                     output_dir=run_dir,
@@ -215,17 +265,23 @@ class Evaluator:
                     delay_model=cstr.get("delay_model", "unit"),
                     generator=cstr.get("generator", "pipeline"),
                     ppa_mode=self.ppa_mode,
+                    on_stage_start=_design_stage_start,
+                    on_stage=_design_stage,
                 )
             except _sp.TimeoutExpired as exc:
-                # AI-generated scheduler hung (infinite loop / excessive complexity).
-                # Treat as run_failed for this design; continue to next design.
                 msg = (
                     f"{design.stem}: pipeline stage timed out "
                     f"({exc.timeout:.0f}s) — scheduler likely too slow"
                 )
                 LOG.warning(msg)
                 timeout_errors.append(msg)
+                max_runtime_s = max(max_runtime_s, 3600.0)
                 continue
+
+            # Always capture runtime from benchmark_output, even on failure.
+            # pipeline.py sets benchmark_output with runtime_s on timeout/no-ppa.
+            if result.benchmark_output and result.benchmark_output.runtime_s > 0:
+                max_runtime_s = max(max_runtime_s, result.benchmark_output.runtime_s)
 
             if not result.success:
                 continue
@@ -239,16 +295,16 @@ class Evaluator:
             if not ppa.feasible:
                 continue
 
-            any_feasible  = True
-            total_stages += ppa.num_stages
-            total_flops  += ppa.effective_flop_count
-            total_area   += ppa.total_area_um2
-            max_delay     = max(max_delay, ppa.critical_path_ps)
-            max_min_clock = max(max_min_clock, ppa.min_clock_period_ps)
+            any_feasible   = True
+            total_stages  += ppa.num_stages
+            total_flops   += ppa.effective_flop_count
+            total_area    += ppa.total_area_um2
+            max_delay      = max(max_delay, ppa.critical_path_ps)
+            max_min_clock  = max(max_min_clock, ppa.min_clock_period_ps)
 
         if not any_feasible:
             err = "; ".join(timeout_errors) if timeout_errors else "no design met constraints"
-            return PPAMetrics(feasible=False), err
+            return PPAMetrics(feasible=False, scheduler_runtime_s=max_runtime_s), err
 
         agg = PPAMetrics(
             num_stages=total_stages,
@@ -257,6 +313,7 @@ class Evaluator:
             total_pipeline_flops=total_flops,
             critical_path_ps=max_delay,
             min_clock_period_ps=max_min_clock,
+            scheduler_runtime_s=max_runtime_s,
             feasible=True,
         )
         agg._compute()

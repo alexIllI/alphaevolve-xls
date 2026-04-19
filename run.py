@@ -161,6 +161,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--benchmark_timeout", type=int, default=1800,
+        help=(
+            "Seconds before benchmark_main is killed. Default: 1800 (30 min). "
+            "A timed-out run records runtime_s=3600 as a score penalty. "
+            "Use a smaller value (e.g. 300) to fail fast during debugging."
+        ),
+    )
+    parser.add_argument(
         "--dry_run", action="store_true",
         help="Run the pipeline without calling the AI (validates setup only).",
     )
@@ -185,6 +193,7 @@ def main() -> int:
         evo_cfg = yaml.safe_load(f)
 
     from alphaevolve.ppa_metrics import configure_scoring
+    import alphaevolve.ppa_metrics as _ppa_mod
 
     # CLI overrides
     if args.mutation_target:
@@ -271,7 +280,8 @@ def main() -> int:
     pipeline = XLSPipeline(
         prebuilt_bin_dir=prebuilt,
         bazel_bin_dir=bazel_bin if builder.is_built("codegen_main") else None,
-        dslx_stdlib_path=xls_src / "xls" / "dslx" / "stdlib",  # for float32 etc.
+        dslx_stdlib_path=xls_src / "xls" / "dslx" / "stdlib",
+        benchmark_timeout=args.benchmark_timeout,
     )
 
     # ── Check for leftover .bak (previous run crashed before restore) ────────
@@ -540,6 +550,8 @@ def main() -> int:
                     parent_num_stages=parent_stages,
                     parent_reg_bits=parent_regs,
                     parent_delay_ps=parent_delay,
+                    clock_period_ps=ppa_cfg.get("clock_period_ps", 1000),
+                    pipeline_stages=ppa_cfg.get("pipeline_stages"),
                     baseline_benchmark_context=baseline_benchmark_context or None,
                     compile_error=last_compile_error,   # None on first attempt
                     target_file_path=target_file_rel,
@@ -553,14 +565,60 @@ def main() -> int:
                 break   # sampling itself failed — no point retrying
 
             # ── Evaluate (patch → build → run → score) ────────────────────────
-            status_label = f"[yellow]Building XLS{' (retry)' if attempt > 1 else ''}...[/]"
-            with console.status(status_label):
+            # on_stage_start  → updates the spinner text so the user knows which
+            #                   stage is currently blocking + writes to stage log
+            # on_stage        → prints a completion line above the spinner
+            # Both also append to a real-time log file the user can tail -f.
+            _STAGE_ICONS = {
+                "ok":      "[green]✓[/]",
+                "failed":  "[red]✗[/]",
+                "skipped": "[dim]↷[/]",
+                "timeout": "[yellow]⏱[/]",
+                "no-ppa":  "[yellow]?[/]",
+            }
+
+            _stage_log_path = (
+                evaluator.output_dir
+                / f"iter{iteration:04d}_island{island.id}_stages.log"
+            )
+            _stage_log_lines: list[str] = []
+
+            def _slog(msg: str) -> None:
+                import datetime as _dt
+                ts = _dt.datetime.now().strftime("%H:%M:%S")
+                _stage_log_lines.append(f"[{ts}] {msg}")
+                _stage_log_path.write_text(
+                    "\n".join(_stage_log_lines) + "\n", encoding="utf-8"
+                )
+
+            def _on_stage_start(name: str, extra: str = "") -> None:
+                extra_str = f"  ({extra})" if extra else ""
+                _spinner_status.update(
+                    f"[yellow]▷ {name}{extra_str}[/]"
+                )
+                _slog(f"START  {name}{extra_str}")
+
+            def _on_stage(name: str, st: str, duration_s: float, extra: str = "") -> None:
+                icon = _STAGE_ICONS.get(st, "[dim]·[/]")
+                extra_str = f"  [dim]{extra}[/]" if extra else ""
+                console.print(
+                    f"    {icon} {name:<22} {duration_s:5.1f}s{extra_str}",
+                    highlight=False,
+                )
+                _slog(f"END    {name} [{st}] {duration_s:.1f}s{('  ' + extra) if extra else ''}")
+                _spinner_status.update("[dim]waiting for next stage...[/]")
+
+            _slog(f"attempt={attempt}/{max_retries}  iteration={iteration+1}  island={island.id}")
+            _retry_tag = f" (retry {attempt})" if attempt > 1 else ""
+            with console.status(f"[yellow]▷ compile{_retry_tag}...[/]") as _spinner_status:
                 result = evaluator.evaluate(
                     iteration=iteration,
                     island_id=island.id,
                     parent_id=parent.id if parent else None,
                     mutation_type=mutation_type,
                     generated_code=generated_code,
+                    on_stage_start=_on_stage_start,
+                    on_stage=_on_stage,
                 )
 
             c = result.candidate
@@ -620,9 +678,38 @@ def main() -> int:
         island_mgr.record(c, island)
 
         if c.build_status == "success":
+            ppa = result.ppa
+            # Build the score formula string so it's clear how the number was reached.
+            # Only include terms whose weight is non-zero.
+            sw = _ppa_mod.STAGE_WEIGHT
+            fw = _ppa_mod.FLOP_WEIGHT
+            aw = _ppa_mod.AREA_WEIGHT
+            dw = _ppa_mod.DELAY_WEIGHT
+            rw = _ppa_mod.RUNTIME_WEIGHT
+            formula_parts = [f"{ppa.num_stages}×{sw:.0f}"]
+            if aw:
+                formula_parts.append(f"{ppa.total_area_um2:.0f}×{aw:.0f}")
+            if dw:
+                formula_parts.append(f"{ppa.critical_path_ps}×{dw:.0f}")
+            if fw:
+                formula_parts.append(f"{ppa.effective_flop_count}×{fw:.0f}")
+            if rw:
+                formula_parts.append(f"{ppa.scheduler_runtime_s:.0f}s×{rw:.0f}")
+            formula = " + ".join(formula_parts)
             console.print(
-                f"  [green]✓[/] stages={c.num_stages} regs={c.pipeline_reg_bits} "
-                f"score={c.ppa_score:.0f} | build={c.build_duration_s:.0f}s"
+                f"  [green]✓[/] "
+                f"stages=[cyan]{c.num_stages}[/]  "
+                f"area=[cyan]{ppa.total_area_um2:.0f}[/]um²  "
+                f"delay=[cyan]{ppa.critical_path_ps}[/]ps  "
+                f"regs=[cyan]{c.pipeline_reg_bits}[/]  "
+                f"runtime=[cyan]{ppa.scheduler_runtime_s:.1f}[/]s  "
+                f"score=[bold cyan]{c.ppa_score:.0f}[/]  "
+                f"| build={c.build_duration_s:.0f}s",
+                highlight=False,
+            )
+            console.print(
+                f"    [dim]score = {formula} = {c.ppa_score:.0f}[/]",
+                highlight=False,
             )
         elif c.build_status == "run_failed":
             console.print(

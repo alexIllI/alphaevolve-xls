@@ -62,6 +62,8 @@ class Sampler:
         parent_num_stages: int,
         parent_reg_bits: int,
         parent_delay_ps: int,
+        clock_period_ps: int = 1000,
+        pipeline_stages: int | None = None,  # None = scheduler decides
         knowledge_keys: list[str] | None = None,
         baseline_benchmark_context: str | None = None,  # from design/<name>_benchmark.txt
         compile_error: str | None = None,   # set on retry so AI can fix its mistake
@@ -91,6 +93,8 @@ class Sampler:
             parent_num_stages=parent_num_stages,
             parent_reg_bits=parent_reg_bits,
             parent_delay_ps=parent_delay_ps,
+            clock_period_ps=clock_period_ps,
+            pipeline_stages=pipeline_stages,
             knowledge_context=knowledge_context,
             baseline_benchmark_context=baseline_benchmark_context,
             compile_error=compile_error,    # None on first attempt

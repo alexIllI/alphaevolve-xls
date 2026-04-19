@@ -42,6 +42,7 @@ STAGE_WEIGHT = 200.0
 FLOP_WEIGHT = 0.0
 AREA_WEIGHT = 1.0
 DELAY_WEIGHT = 1.0
+RUNTIME_WEIGHT = 1.0   # seconds of benchmark_main execution; 3600 penalty on timeout
 
 
 def configure_scoring(
@@ -50,9 +51,10 @@ def configure_scoring(
     flop_weight: float | None = None,
     area_weight: float | None = None,
     delay_weight: float | None = None,
+    runtime_weight: float | None = None,
 ) -> None:
     """Override module scoring weights for the current process."""
-    global STAGE_WEIGHT, FLOP_WEIGHT, AREA_WEIGHT, DELAY_WEIGHT
+    global STAGE_WEIGHT, FLOP_WEIGHT, AREA_WEIGHT, DELAY_WEIGHT, RUNTIME_WEIGHT
 
     if stage_weight is not None:
         STAGE_WEIGHT = float(stage_weight)
@@ -62,6 +64,8 @@ def configure_scoring(
         AREA_WEIGHT = float(area_weight)
     if delay_weight is not None:
         DELAY_WEIGHT = float(delay_weight)
+    if runtime_weight is not None:
+        RUNTIME_WEIGHT = float(runtime_weight)
 
 
 @dataclass
@@ -84,6 +88,9 @@ class PPAMetrics:
     max_reg_to_output_delay_ps: int = 0
     max_feedthrough_path_delay_ps: int = 0
 
+    # ── Scheduler execution time (from benchmark_main wall-clock) ────────────
+    scheduler_runtime_s: float = 0.0   # 3600 if timed out (penalty)
+
     # ── Derived ───────────────────────────────────────────────────────────────
     feasible: bool = False
     score: float = float("inf")
@@ -102,10 +109,11 @@ class PPAMetrics:
         """Recompute score from current field values."""
         if self.feasible:
             self.score = (
-                self.num_stages          * STAGE_WEIGHT
+                self.num_stages             * STAGE_WEIGHT
                 + self.effective_flop_count * FLOP_WEIGHT
-                + self.total_area_um2    * AREA_WEIGHT
-                + self.critical_path_ps  * DELAY_WEIGHT
+                + self.total_area_um2       * AREA_WEIGHT
+                + self.critical_path_ps     * DELAY_WEIGHT
+                + self.scheduler_runtime_s  * RUNTIME_WEIGHT
             )
 
 
@@ -132,6 +140,7 @@ def parse_benchmark_output(bm: "BenchmarkOutput") -> dict:
         "num_stages":            bm.num_stages,
         "min_clock_period_ps":   bm.min_clock_period_ps,
         "min_stage_slack_ps":    bm.min_stage_slack_ps,
+        "scheduler_runtime_s":   bm.runtime_s,
     }
 
 
@@ -210,6 +219,7 @@ def extract_ppa(
         m.num_stages           = bm["num_stages"]
         m.min_clock_period_ps  = bm["min_clock_period_ps"]
         m.min_stage_slack_ps   = bm["min_stage_slack_ps"]
+        m.scheduler_runtime_s  = bm["scheduler_runtime_s"]
 
     # ── 2. Schedule textproto (fills num_stages if benchmark didn't) ──────────
     if has_schedule:

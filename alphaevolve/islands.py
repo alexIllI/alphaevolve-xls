@@ -135,25 +135,67 @@ class IslandManager:
     # design points on a PPA graph cover very different regions of the
     # area/delay/stages trade-off space before evolution starts mixing them.
     # Each targets a completely different algorithmic family.
+    # Runtime-complexity warning prepended to every bootstrap instruction.
+    # sha256 produces ~800 IR nodes after opt_main; larger designs can have 1000+.
+    # benchmark_main has a configurable timeout (default 30 min); a timed-out run
+    # records runtime_s=3600 as a score *penalty*, so slow algorithms are penalised
+    # even if they would eventually produce valid PPA.
+    _RUNTIME_WARNING = (
+        "\n\nCOMPLEXITY CONSTRAINT — READ BEFORE WRITING CODE:\n"
+        "The design under evaluation (e.g. sha256) has ~800 IR nodes after "
+        "optimisation. Larger benchmarks can have 1000+ nodes. "
+        "Your scheduler runs inside benchmark_main and is killed after a "
+        "configurable timeout (default 30 min). A timeout records "
+        "runtime_s=3600 as a score penalty — slow algorithms lose even if "
+        "they would produce good PPA. "
+        "You MUST implement a single-pass O(n × W) algorithm where n = number "
+        "of timed nodes and W = max candidate-cycle window per node (usually <20). "
+        "Any O(n²) or higher inner loop will time out on sha256. "
+        "No unbounded iteration, no repeated full-graph passes, no exponential search."
+    )
+
     _BOOTSTRAP_INSTRUCTIONS: dict[str, list[str]] = {
         "agent_scheduler": [
-            # Bootstrap 0: Pure ALAP — schedule every node as LATE as possible.
-            # Opposite extreme from ASAP. Values are computed at the last legal
-            # cycle, which pushes register pressure toward the back of the
-            # pipeline and tends to produce fewer stages than register-aware
-            # heuristics but with a very different register distribution.
+            # Bootstrap 0: DP-on-DAG scheduler.
+            # The scheduling problem on a DAG has optimal substructure: the best
+            # cycle for node v depends only on which cycles its operands occupy
+            # (already committed by the time v is processed in TopoSort order).
+            # This bootstrap asks the AI to exploit that structure by building a
+            # memoised cost table over the DAG and making each node's decision
+            # in a single forward pass — a true DP, not just a greedy heuristic.
             (
-                "Implement a pure ALAP (As-Late-As-Possible) scheduler. "
-                "For every timed node in TopoSort(f) order, assign it to "
-                "bounds->ub(node) — the latest legal cycle — without any "
-                "further scoring or tie-breaking. Call "
-                "bounds->TightenNodeLb(node, cycle), "
-                "bounds->TightenNodeUb(node, cycle), and "
-                "bounds->PropagateBounds() after each assignment. "
-                "The goal is to produce a baseline that is the furthest "
-                "possible from ASAP scheduling, deferring every computation "
-                "to the last permissible moment. Keep the implementation "
-                "short and direct — no helper scoring functions needed."
+                "Implement a DAG-DP pipeline scheduler.\n\n"
+                "The key insight: processed in topological order, each node v's "
+                "placement decision is a self-contained subproblem whose optimal "
+                "solution depends only on the already-committed placements of v's "
+                "operands. This gives the scheduling problem optimal substructure "
+                "suitable for dynamic programming.\n\n"
+                "Step 1 — Build a memoised cost table.\n"
+                "Allocate absl::flat_hash_map<Node*, int64_t> best_cost, initialised "
+                "to 0 for all nodes. Process every timed node v in TopoSort(f) order "
+                "(skip IsUntimed). For each candidate cycle c in "
+                "[bounds->lb(v), bounds->ub(v)] compute:\n"
+                "  cost(v, c) = sum over each operand u of v:\n"
+                "                 max(0, c - assigned_cycle[u]) "
+                "                 * u->GetType()->GetFlatBitCount()\n"
+                "This counts the total register-bit-stages consumed if v is placed "
+                "at c: each operand u whose value must be pipelined across "
+                "(c - assigned_cycle[u]) stage boundaries contributes its bit-width "
+                "per crossing. Select c* = argmin cost(v, c) over the legal range "
+                "(tie-break: prefer the smallest c to minimise downstream pressure). "
+                "Record best_cost[v] = cost(v, c*) and assigned_cycle[v] = c*, "
+                "then call bounds->TightenNodeLb(v, c*), bounds->TightenNodeUb(v, c*), "
+                "and bounds->PropagateBounds() before moving to the next node.\n\n"
+                "Step 2 — Handle fan-out pressure.\n"
+                "After assigning c* to v, scan v->users(). For any user w that is "
+                "already in the TopoSort prefix (already assigned), check whether "
+                "best_cost[w] increases under the new placement of v; if so, update "
+                "best_cost[w] in the table (the assignment itself is final — this is "
+                "a bookkeeping update only, not a reassignment).\n\n"
+                "Step 3 — Return the schedule.\n"
+                "Build and return the ScheduleCycleMap from assigned_cycle. "
+                "The result minimises the total pipeline register pressure across "
+                "all data edges in a single O(nodes × candidate_cycles) forward pass."
             ),
             # Bootstrap 1: Stage-load balancing — equalize node count per stage.
             # Neither ASAP nor ALAP: instead track how many nodes have been placed
@@ -212,7 +254,7 @@ class IslandManager:
             self._BOOTSTRAP_INSTRUCTIONS["agent_scheduler"],
         )
         if iteration < len(bootstrap):
-            return bootstrap[iteration]
+            return bootstrap[iteration] + self._RUNTIME_WARNING
 
         # Normal rotation for iteration >= 3
         # Mutation target: AgentGeneratedScheduler() in
@@ -267,4 +309,4 @@ class IslandManager:
 
         v = variants.get(island.mutation_type, variants["agent_scheduler"])
         # Offset by len(bootstrap) so iteration 3 → variant 0, not a re-use of it
-        return v[(iteration - len(bootstrap)) % len(v)]
+        return v[(iteration - len(bootstrap)) % len(v)] + self._RUNTIME_WARNING
