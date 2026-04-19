@@ -320,19 +320,46 @@ Other:
 
 Placeholder modes emit a warning and evaluate as if the mode were `fast`.
 
-Score weights (`stage_weight`, `reg_weight`, `area_weight`, `delay_weight`, `runtime_weight`) live in `configs/evolve_config.yaml`. Lower scores are better. In `fast` mode the area term is zero (codegen does not emit absolute silicon area); scoring is dominated by stages and register bits.
+Score weights and normalization references live in `configs/evolve_config.yaml`. Lower scores are better. All six metrics are **normalized to [0, 1]** before weighting, so weights are directly comparable regardless of raw units.
 
 The score formula is:
 
 ```
-score = num_stages        × stage_weight   (default 200)
-      + pipeline_flops    × flop_weight    (default 0)
-      + area_um²          × area_weight    (default 1)
-      + critical_path_ps  × delay_weight   (default 1)
-      + scheduler_runtime_s × runtime_weight (default 1)
+score = (num_stages           / ref_stages)    × stage_weight    (default 1.0)   ← penalise depth
+      + (effective_flop_bits  / ref_flop_bits) × flop_weight     (default 0.5)   ← penalise reg bits
+      + (total_area_um²       / ref_area_um²)  × area_weight     (default 0.2)   ← penalise area
+      + (max_stage_delay_ps   / ref_clock_ps)  × delay_weight    (default 2.0)   ← penalise tight stages
+      + balance_cv_norm                        × balance_weight  (default 1.5)   ← penalise uneven load
+      + (scheduler_runtime_s  / ref_timeout_s) × runtime_weight  (default 0.5)   ← penalise slow algos
 ```
 
-Scheduler execution time is measured by `benchmark_main`'s wall clock. A scheduler that times out records `runtime_s = 3600` regardless of the actual timeout setting, imposing a large penalty to discourage O(n²) or worse algorithms. This is only active in `--ppa_mode slow` where `benchmark_main` actually runs.
+Reference values are set automatically from CLI arguments:
+
+| Reference        | Source                    | Default |
+|------------------|---------------------------|---------|
+| `ref_clock_ps`   | `--clock_period`          | (required) |
+| `ref_timeout_s`  | `--benchmark_timeout`     | 1800 s |
+| `ref_stages`     | `pipeline_stages` in YAML | 16 |
+| `ref_flop_bits`  | `evolve_config.yaml`      | 10000 |
+| `ref_area_um²`   | `evolve_config.yaml`      | 50000 |
+
+**balance_cv_norm — stage load distribution metric:**
+
+`balance_cv_norm` measures how evenly the combinational delay is spread across pipeline stages.  It is the Coefficient of Variation (CV) of per-stage delays, normalised to [0, 1]:
+
+```
+CV              = population_std(stage_delays) / mean(stage_delays)
+balance_cv_norm = CV / sqrt(N − 1)          # max CV for N stages = sqrt(N−1)
+```
+
+- **0** = all stages have identical delay (perfect load balance) — best score.
+- **1** = all delay concentrated in a single stage — worst possible imbalance.
+
+This is a genuinely independent metric: two schedules with the same `max_stage_delay_ps` can differ in `balance_cv_norm` if one has a uniform distribution and the other has a handful of nearly-empty stages.
+
+`max_stage_delay_ps` is the maximum combinational delay across all pipeline stages (extracted from the `nodes: N, delay: Xps` lines in `benchmark_main` output). Unlike the old `critical_path_ps` metric (which was the total design critical path — a constant regardless of scheduling), `max_stage_delay_ps` changes with every scheduling decision and is the primary differentiator between scheduler quality.
+
+Scheduler execution time is measured by `benchmark_main`'s wall clock. A scheduler that times out records `runtime_s = 3600` regardless of the actual timeout setting, giving a `3600 / ref_timeout_s` normalized penalty. This is only active in `--ppa_mode slow`.
 
 ---
 
@@ -371,8 +398,10 @@ Per iteration:
        DSLX → IR → opt → benchmark_main (slow: runs the AI scheduler, tracked as
                           "AI scheduler" on the console) → codegen (fast only)
   7. Extract PPA (block_metrics in fast, benchmark_main stdout in slow).
-  8. Score = stages×stage_weight + flops×flop_weight + area×area_weight
-           + delay×delay_weight + runtime_s×runtime_weight.
+  8. Score = normalized(stages)×stage_weight + normalized(flops)×flop_weight
+           + normalized(area)×area_weight + normalized(max_stage_delay)×delay_weight
+           + balance_cv_norm×balance_weight
+           + normalized(runtime_s)×runtime_weight.
   9. Insert candidate in SQLite; update island.
  10. If score improved, write results/<run>/best_algorithm.patch.
  11. Restore the original agent_generated_scheduler.cc.

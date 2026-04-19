@@ -27,7 +27,8 @@ from pathlib import Path
 @dataclass
 class BenchmarkOutput:
     """Parsed output from benchmark_main stdout."""
-    critical_path_ps: int = 0
+    critical_path_ps: int = 0      # total design CP (constant regardless of schedule)
+    max_stage_delay_ps: int = 0    # max delay across all pipeline stages (schedule-sensitive)
     total_delay_ps: int = 0
     total_area_um2: float = 0.0
     total_pipeline_flops: int = 0
@@ -36,6 +37,7 @@ class BenchmarkOutput:
     num_stages: int = 0                # inferred from stage count in output
     runtime_s: float = 0.0            # wall-clock seconds benchmark_main ran
     raw_stdout: str = ""
+    stage_delays: list = field(default_factory=list)  # per-stage delay list (ps)
 
 
 @dataclass
@@ -458,23 +460,41 @@ def parse_benchmark_stdout(text: str) -> BenchmarkOutput:
         Total pipeline flops: 0 (0 dups,    0 constant)
         Min stage slack: 996
     """
-    # ── critical_path_ps: max of stated critical path headers + all stage delays ─
+    # ── critical_path_ps: total design critical path from the header ─────────────
+    # This is the full combinational path and is constant regardless of schedule.
     cp_from_header = max(
         (int(m.group(1)) for m in re.finditer(r"Critical path delay:\s*(\d+)ps", text)),
         default=0,
     )
-    # "nodes: N, delay: Xps"  — appears for every pipeline section regardless of stage count
-    stage_delay_matches = re.finditer(
-        r"(?:\[\s*Stage\s+\d+\]\s*nodes:\s*\d+,\s*delay:\s*(\d+)ps)|"
-        r"(?:^\s*nodes:\s*\d+,\s*delay:\s*(\d+)ps)",
+
+    # ── stage_delays + max_stage_delay_ps ────────────────────────────────────────
+    # The pipeline block has two kinds of "nodes: N, delay: Xps" lines:
+    #   1. A SUMMARY line (first entry, before [Stage 0]) = full-pipeline rollup.
+    #      This is NOT a per-stage delay and MUST be excluded from stage_delays.
+    #   2. PER-STAGE lines — one after each "[Stage K] flops:" label.
+    #      These are what we want for the balance (CV) metric and max delay.
+    #
+    # Pattern: match "[Stage K] flops:...<rest of line>\n<spaces>nodes: N, delay: Xps"
+    # This anchors us to the per-stage line and skips the summary entirely.
+    stage_delays_list: list[int] = []
+    for m in re.finditer(
+        r"\[Stage\s+\d+\]\s+flops:[^\n]*\n\s*nodes:\s*\d+,\s*delay:\s*(\d+)ps",
         text,
         re.MULTILINE,
-    )
-    cp_from_stages = max(
-        (int(m.group(1) or m.group(2)) for m in stage_delay_matches),
-        default=0,
-    )
-    critical_path_ps = max(cp_from_header, cp_from_stages)
+    ):
+        stage_delays_list.append(int(m.group(1)))
+
+    if stage_delays_list:
+        max_stage_delay_ps = max(stage_delays_list)
+    else:
+        # Single-stage or formats without [Stage N] labels: fall back to the
+        # first standalone "nodes: N, delay: Xps" line (the summary = only stage).
+        fb = re.search(r"^\s*nodes:\s*\d+,\s*delay:\s*(\d+)ps", text, re.MULTILINE)
+        max_stage_delay_ps = int(fb.group(1)) if fb else 0
+        if max_stage_delay_ps:
+            stage_delays_list = [max_stage_delay_ps]
+
+    critical_path_ps = max(cp_from_header, max_stage_delay_ps)
 
     # ── total_pipeline_flops: SUM across all procs ────────────────────────────
     total_pipeline_flops = sum(
@@ -505,10 +525,12 @@ def parse_benchmark_stdout(text: str) -> BenchmarkOutput:
 
     return BenchmarkOutput(
         critical_path_ps     = critical_path_ps,
+        max_stage_delay_ps   = max_stage_delay_ps,
         total_delay_ps       = total_delay_ps,
         total_area_um2       = total_area_um2,
         total_pipeline_flops = total_pipeline_flops,
         min_clock_period_ps  = _int(r"Min clock period ps:\s*(\d+)"),
         min_stage_slack_ps   = _int(r"Min stage slack:\s*(-?\d+)"),
         num_stages           = num_stages,
+        stage_delays         = stage_delays_list,
     )

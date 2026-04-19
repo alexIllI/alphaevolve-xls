@@ -31,23 +31,29 @@ bazel_jobs: 8           # Parallel Bazel jobs (set to your core count)
 max_build_retries: 3    # Per iteration: retry compile this many times with error feedback
 
 # ── PPA Scoring ───────────────────────────────────────────────────────────────
-# Score = num_stages * stage_weight
-#       + pipeline_flops * power_weight
-#       + area_um2 * area_weight
-#       + critical_path_ps * delay_weight
+# Score uses normalized terms inside ppa_metrics.py:
+#   (num_stages / REF_STAGES)            * stage_weight
+# + (pipeline_flops / REF_FLOP_BITS)     * power_weight
+# + (area_um2 / REF_AREA_UM2)            * area_weight
+# + (max_stage_delay_ps / REF_CLOCK_PS)  * delay_weight
+# + balance_norm                         * balance_weight
+# + (runtime_s / REF_TIMEOUT_S)          * runtime_weight
 # Lower is better.
 #
 # For scheduler evolution:
-# - `power_weight` uses pipeline flop bits as an optional proxy only
-# - default power weight is 0 because benchmark_main does not report real power
-# - `area_weight` is intentionally modest because benchmark_main total area is
-#   mostly structural IR area, which scheduling changes less directly
+# - `stage_weight` should stay modest. When the clock period and/or target stage
+#   count is already constrained by the user, stage count should not dominate.
+# - `power_weight` uses pipeline flop bits as an optional proxy only.
+# - `area_weight` is intentionally modest because scheduling changes area less
+#   directly than timing and balance.
 # - `reg_weight` is still accepted as a backward-compatible alias for
-#   `power_weight`
-stage_weight: 200
+#   `power_weight`.
+stage_weight: 0.25
 power_weight: 0
 area_weight: 1
 delay_weight: 1
+balance_weight: 1.5
+runtime_weight: 0.5
 reg_weight: 1           # Deprecated alias for power_weight
 
 # ── Logging ───────────────────────────────────────────────────────────────────

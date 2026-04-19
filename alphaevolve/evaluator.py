@@ -195,7 +195,7 @@ class Evaluator:
             build_status="success" if aggregate_ppa.feasible else "run_failed",
             num_stages=aggregate_ppa.num_stages,
             pipeline_reg_bits=aggregate_ppa.pipeline_reg_bits,
-            max_stage_delay_ps=aggregate_ppa.critical_path_ps,
+            max_stage_delay_ps=aggregate_ppa.max_stage_delay_ps,
             min_clock_period_ps=aggregate_ppa.min_clock_period_ps,
             ppa_score=aggregate_ppa.score,
             build_duration_s=build_result.duration_seconds if build_result else 0.0,
@@ -229,12 +229,14 @@ class Evaluator:
         """
         import subprocess as _sp
 
-        total_stages = 0
-        total_flops  = 0
-        total_area   = 0.0
-        max_delay    = 0
-        max_min_clock = 0
-        max_runtime_s = 0.0   # worst scheduler runtime across all designs
+        total_stages    = 0
+        total_flops     = 0
+        total_area      = 0.0
+        max_cp          = 0   # max critical_path_ps (header, constant)
+        max_stage_delay = 0   # max max_stage_delay_ps (per-stage, schedule-sensitive)
+        all_stage_delays: list[int] = []   # concat of all per-stage delay lists
+        max_min_clock   = 0
+        max_runtime_s   = 0.0   # worst scheduler runtime across all designs
         any_feasible = False
         timeout_errors: list[str] = []
 
@@ -295,23 +297,31 @@ class Evaluator:
             if not ppa.feasible:
                 continue
 
-            any_feasible   = True
-            total_stages  += ppa.num_stages
-            total_flops   += ppa.effective_flop_count
-            total_area    += ppa.total_area_um2
-            max_delay      = max(max_delay, ppa.critical_path_ps)
-            max_min_clock  = max(max_min_clock, ppa.min_clock_period_ps)
+            any_feasible      = True
+            total_stages     += ppa.num_stages
+            total_flops      += ppa.effective_flop_count
+            total_area       += ppa.total_area_um2
+            max_cp            = max(max_cp, ppa.critical_path_ps)
+            max_stage_delay   = max(max_stage_delay, ppa.max_stage_delay_ps)
+            all_stage_delays.extend(ppa.stage_delays)
+            max_min_clock     = max(max_min_clock, ppa.min_clock_period_ps)
 
         if not any_feasible:
             err = "; ".join(timeout_errors) if timeout_errors else "no design met constraints"
             return PPAMetrics(feasible=False, scheduler_runtime_s=max_runtime_s), err
+
+        # If stage-level delays were parsed (slow mode), use the per-stage max.
+        # Fall back to the full-design critical-path header when not available.
+        agg_max_stage_delay = max_stage_delay if max_stage_delay > 0 else max_cp
 
         agg = PPAMetrics(
             num_stages=total_stages,
             flop_count=total_flops,
             total_area_um2=total_area,
             total_pipeline_flops=total_flops,
-            critical_path_ps=max_delay,
+            critical_path_ps=max_cp,
+            max_stage_delay_ps=agg_max_stage_delay,
+            stage_delays=all_stage_delays,
             min_clock_period_ps=max_min_clock,
             scheduler_runtime_s=max_runtime_s,
             feasible=True,

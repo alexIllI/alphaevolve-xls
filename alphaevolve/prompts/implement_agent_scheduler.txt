@@ -50,12 +50,12 @@ nodes across stages even when the clock allows fitting them all in one stage.
 
 == CURRENT PPA SCORE ==
 {% if best_score is not none %}
-Best score so far: {{ best_score | int }} (lower is better)
+Best score so far: {{ '%.4f' | format(best_score) }} (lower is better)
   ↳ {{ best_num_stages }} pipeline stages, {{ best_reg_bits }} register bits, {{ best_delay_ps }}ps critical path
 {% else %}
 Best score so far: none yet — you are the first iteration, aim to produce a valid schedule.
 {% endif %}
-Parent candidate score: {{ parent_score }}
+Parent candidate score: {{ '%.4f' | format(parent_score) }}
   ↳ {{ parent_num_stages }} stages, {{ parent_reg_bits }} register bits, {{ parent_delay_ps }}ps
 
 {% if baseline_benchmark_context %}

@@ -224,11 +224,20 @@ def main() -> int:
     # Score tuning for scheduler evolution.
     # `power_weight` is the preferred config name; `reg_weight` is kept as a
     # backwards-compatible alias for the pipeline-flop proxy term.
+    # Reference values normalize raw metric units so weights are directly comparable.
+    _pipeline_stages = ppa_cfg.get("pipeline_stages")
     configure_scoring(
         stage_weight=evo_cfg.get("stage_weight"),
         flop_weight=evo_cfg.get("power_weight", evo_cfg.get("reg_weight")),
         area_weight=evo_cfg.get("area_weight"),
         delay_weight=evo_cfg.get("delay_weight"),
+        balance_weight=evo_cfg.get("balance_weight"),
+        runtime_weight=evo_cfg.get("runtime_weight"),
+        ref_stages=_pipeline_stages if _pipeline_stages else evo_cfg.get("ref_stages", 16),
+        ref_flop_bits=evo_cfg.get("ref_flop_bits"),
+        ref_area_um2=evo_cfg.get("ref_area_um2"),
+        ref_clock_ps=args.clock_period,
+        ref_timeout_s=args.benchmark_timeout,
     )
 
     # ── Output directory ──────────────────────────────────────────────────────
@@ -248,11 +257,15 @@ def main() -> int:
     console.print(f"  Clock period     : [green]{args.clock_period} ps[/]")
     console.print(f"  PPA mode         : [green]{ppa_mode}[/]")
     console.print(
-        "  Score weights    : "
-        f"[green]stage={evo_cfg.get('stage_weight', 200)} "
-        f"power={evo_cfg.get('power_weight', evo_cfg.get('reg_weight', 1))} "
-        f"area={evo_cfg.get('area_weight', 1)} "
-        f"delay={evo_cfg.get('delay_weight', 1)}[/]"
+        "  Score formula    : "
+        f"[green]"
+        f"(stg/{_ppa_mod.REF_STAGES})×{_ppa_mod.STAGE_WEIGHT} "
+        f"+ (dly/{_ppa_mod.REF_CLOCK_PS}ps)×{_ppa_mod.DELAY_WEIGHT} "
+        f"+ bal_cv×{_ppa_mod.BALANCE_WEIGHT} "
+        f"+ (area/{_ppa_mod.REF_AREA_UM2:.0f}um²)×{_ppa_mod.AREA_WEIGHT} "
+        f"+ (flp/{_ppa_mod.REF_FLOP_BITS})×{_ppa_mod.FLOP_WEIGHT} "
+        f"+ (rt/{_ppa_mod.REF_TIMEOUT_S:.0f}s)×{_ppa_mod.RUNTIME_WEIGHT}"
+        f"[/]"
     )
     console.print()
 
@@ -391,7 +404,7 @@ def main() -> int:
                     f"{ppa.effective_flop_count} flops, "
                     f"crit_path={ppa.critical_path_ps}ps, "
                     f"area={ppa.total_area_um2:.1f}um², "
-                    f"score={ppa.score:.0f}  [dim]({bm_src})[/]"
+                    f"score={ppa.score:.4f}  [dim]({bm_src})[/]"
                 )
             else:
                 console.print(f"  [red]✗[/] {design.stem}: {result.stderr[:200]}")
@@ -513,7 +526,7 @@ def main() -> int:
 
         mutation_instruction = island_mgr.mutation_instruction_for(island, iteration)
 
-        _best_label = f"{best_score:.0f}" if best_score < float("inf") else "none"
+        _best_label = f"{best_score:.4f}" if best_score < float("inf") else "none"
         console.print(
             f"\n[bold]Iteration {iteration + 1}/{args.iterations}[/] "
             f"Island {island.id} | target=[cyan]{mutation_type}[/] | "
@@ -679,36 +692,40 @@ def main() -> int:
 
         if c.build_status == "success":
             ppa = result.ppa
-            # Build the score formula string so it's clear how the number was reached.
-            # Only include terms whose weight is non-zero.
-            sw = _ppa_mod.STAGE_WEIGHT
-            fw = _ppa_mod.FLOP_WEIGHT
-            aw = _ppa_mod.AREA_WEIGHT
-            dw = _ppa_mod.DELAY_WEIGHT
-            rw = _ppa_mod.RUNTIME_WEIGHT
-            formula_parts = [f"{ppa.num_stages}×{sw:.0f}"]
-            if aw:
-                formula_parts.append(f"{ppa.total_area_um2:.0f}×{aw:.0f}")
+            # Build normalized score breakdown string.
+            t = ppa.normalized_terms()
+            sw  = _ppa_mod.STAGE_WEIGHT
+            fw  = _ppa_mod.FLOP_WEIGHT
+            aw  = _ppa_mod.AREA_WEIGHT
+            dw  = _ppa_mod.DELAY_WEIGHT
+            bw  = _ppa_mod.BALANCE_WEIGHT
+            rw  = _ppa_mod.RUNTIME_WEIGHT
+            parts = [f"stg({t['stage']:.3f})×{sw}"]
             if dw:
-                formula_parts.append(f"{ppa.critical_path_ps}×{dw:.0f}")
+                parts.append(f"dly({t['delay']:.3f})×{dw}")
+            if bw:
+                parts.append(f"bal({t['balance']:.3f})×{bw}")
+            if aw:
+                parts.append(f"area({t['area']:.3f})×{aw}")
             if fw:
-                formula_parts.append(f"{ppa.effective_flop_count}×{fw:.0f}")
+                parts.append(f"flp({t['flop']:.3f})×{fw}")
             if rw:
-                formula_parts.append(f"{ppa.scheduler_runtime_s:.0f}s×{rw:.0f}")
-            formula = " + ".join(formula_parts)
+                parts.append(f"rt({t['runtime']:.3f})×{rw}")
+            formula = " + ".join(parts)
             console.print(
                 f"  [green]✓[/] "
                 f"stages=[cyan]{c.num_stages}[/]  "
                 f"area=[cyan]{ppa.total_area_um2:.0f}[/]um²  "
-                f"delay=[cyan]{ppa.critical_path_ps}[/]ps  "
+                f"max_stg_dly=[cyan]{ppa.max_stage_delay_ps}[/]ps  "
+                f"bal_cv=[cyan]{t['balance']:.3f}[/]  "
                 f"regs=[cyan]{c.pipeline_reg_bits}[/]  "
                 f"runtime=[cyan]{ppa.scheduler_runtime_s:.1f}[/]s  "
-                f"score=[bold cyan]{c.ppa_score:.0f}[/]  "
+                f"score=[bold cyan]{c.ppa_score:.4f}[/]  "
                 f"| build={c.build_duration_s:.0f}s",
                 highlight=False,
             )
             console.print(
-                f"    [dim]score = {formula} = {c.ppa_score:.0f}[/]",
+                f"    [dim]score = {formula} = {c.ppa_score:.4f}[/]",
                 highlight=False,
             )
         elif c.build_status == "run_failed":
@@ -725,7 +742,7 @@ def main() -> int:
             best_score = c.ppa_score
             best_candidate_id = c.id
             console.print(
-                f"  [bold green]★ New best! score={best_score:.0f} "
+                f"  [bold green]★ New best! score={best_score:.4f} "
                 f"({c.num_stages} stages, {c.pipeline_reg_bits} reg bits)[/]"
             )
             # Save best diff immediately
@@ -773,7 +790,7 @@ def main() -> int:
     for c in best_candidates:
         table.add_row(
             str(c.id), str(c.iteration), c.mutation_type,
-            str(c.num_stages), str(c.pipeline_reg_bits), f"{c.ppa_score:.0f}",
+            str(c.num_stages), str(c.pipeline_reg_bits), f"{c.ppa_score:.4f}",
         )
     console.print(table)
 

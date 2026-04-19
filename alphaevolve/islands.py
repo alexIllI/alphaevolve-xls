@@ -142,15 +142,36 @@ class IslandManager:
     # even if they would eventually produce valid PPA.
     _RUNTIME_WARNING = (
         "\n\nCOMPLEXITY CONSTRAINT — READ BEFORE WRITING CODE:\n"
-        "The design under evaluation (e.g. sha256) has ~800 IR nodes after "
-        "optimisation. Larger benchmarks can have 1000+ nodes. "
-        "Your scheduler runs inside benchmark_main and is killed after a "
-        "configurable timeout (default 30 min). A timeout records "
-        "runtime_s=3600 as a score penalty — slow algorithms lose even if "
-        "they would produce good PPA. "
-        "You MUST implement a single-pass O(n × W) algorithm where n = number "
-        "of timed nodes and W = max candidate-cycle window per node (usually <20). "
-        "Any O(n²) or higher inner loop will time out on sha256. "
+        "sha256 has ~5000 IR nodes (4919 measured). Larger benchmarks have even more. "
+        "Your scheduler runs inside benchmark_main with a configurable timeout (default 30 min). "
+        "A timeout records runtime_s=3600 as a score penalty — slow algorithms lose even if "
+        "they would produce good PPA.\n\n"
+        "CRITICAL — bounds->PropagateBounds() IS O(n) PER CALL:\n"
+        "PropagateBounds() walks the entire constraint graph to re-tighten lb/ub for all "
+        "unscheduled nodes. Calling it after every node assignment = O(n) × O(n) = O(n²). "
+        "On 5000 nodes that is ~25 million propagation steps — this is why agent schedulers "
+        "run 15× slower than SDC even on identical schedules.\n\n"
+        "CORRECT PATTERN — call PropagateBounds() ONCE, then track lb manually:\n"
+        "  XLS_RETURN_IF_ERROR(bounds->PropagateBounds());  // ONCE before the main loop\n"
+        "  for (Node* node : topo_nodes) {\n"
+        "    if (IsUntimed(node)) continue;\n"
+        "    int64_t lb = bounds->lb(node);  // set by initial propagation\n"
+        "    // Tighten lb using predecessor assignments — O(degree), not O(n)\n"
+        "    for (Node* pred : node->operands()) {\n"
+        "      if (!IsUntimed(pred) && assigned_cycles.count(pred))\n"
+        "        lb = std::max(lb, assigned_cycles.at(pred));\n"
+        "    }\n"
+        "    int64_t ub = bounds->ub(node);  // from initial propagation — valid upper bound\n"
+        "    lb = std::min(lb, ub);\n"
+        "    // ... pick best cycle in [lb, ub] ...\n"
+        "    assigned_cycles[node] = best_cycle;\n"
+        "    cycle_map[node] = best_cycle;\n"
+        "    XLS_RETURN_IF_ERROR(bounds->TightenNodeLb(node, best_cycle));  // O(1)\n"
+        "    XLS_RETURN_IF_ERROR(bounds->TightenNodeUb(node, best_cycle));  // O(1)\n"
+        "    // DO NOT call bounds->PropagateBounds() here — it is O(n) per call\n"
+        "  }\n\n"
+        "You MUST implement a single-pass O(n × W) algorithm where n = timed nodes and "
+        "W = candidate-cycle window per node (W = ub - lb + 1, typically small). "
         "No unbounded iteration, no repeated full-graph passes, no exponential search."
     )
 
@@ -184,8 +205,11 @@ class IslandManager:
                 "per crossing. Select c* = argmin cost(v, c) over the legal range "
                 "(tie-break: prefer the smallest c to minimise downstream pressure). "
                 "Record best_cost[v] = cost(v, c*) and assigned_cycle[v] = c*, "
-                "then call bounds->TightenNodeLb(v, c*), bounds->TightenNodeUb(v, c*), "
-                "and bounds->PropagateBounds() before moving to the next node.\n\n"
+                "then call bounds->TightenNodeLb(v, c*) and bounds->TightenNodeUb(v, c*) "
+                "(both O(1) — do NOT call bounds->PropagateBounds() here; that is O(n) "
+                "per call and would make the whole scheduler O(n²) on 5000-node designs). "
+                "Track lb for the next node by reading assigned_cycle of its predecessors "
+                "directly — O(degree), not O(n).\n\n"
                 "Step 2 — Handle fan-out pressure.\n"
                 "After assigning c* to v, scan v->users(). For any user w that is "
                 "already in the TopoSort prefix (already assigned), check whether "
@@ -205,13 +229,16 @@ class IslandManager:
             (
                 "Implement a stage-load-balancing scheduler. "
                 "Maintain a per-stage node count array of size pipeline_stages. "
-                "For each timed node in TopoSort(f) order, examine every "
-                "candidate cycle c in [bounds->lb(node), bounds->ub(node)] "
+                "Call bounds->PropagateBounds() ONCE before the loop. "
+                "For each timed node in TopoSort(f) order, compute lb = "
+                "max(bounds->lb(node), max assigned_cycle of timed operands) and "
+                "ub = bounds->ub(node). Examine every candidate cycle c in [lb, ub] "
                 "and choose the c with the smallest current node count "
                 "(tie-break: prefer earlier cycle). Increment the count for "
                 "the chosen stage, record the assignment, call "
-                "bounds->TightenNodeLb/Ub(node, c) and "
-                "bounds->PropagateBounds(). "
+                "bounds->TightenNodeLb/Ub(node, c) (O(1) each). "
+                "DO NOT call bounds->PropagateBounds() inside the loop — "
+                "it is O(n) per call, making the scheduler O(n²) on 5000 nodes. "
                 "The objective is a flat, balanced stage histogram — minimising "
                 "the max-stage node count — which yields a distinct "
                 "combinational-depth profile compared to ASAP or ALAP."
@@ -223,14 +250,18 @@ class IslandManager:
             # pressure. This produces a distinct 'tight-critical-path' profile.
             (
                 "Implement a two-pass critical-path-first scheduler. "
+                "Call bounds->PropagateBounds() ONCE before both passes. "
                 "Pass 1 — schedule CRITICAL nodes (bounds->ub(node) == "
-                "bounds->lb(node), i.e. zero mobility) first, assigning each "
-                "to bounds->lb(node) and propagating bounds immediately. "
+                "bounds->lb(node), i.e. zero mobility) in TopoSort(f) order, "
+                "assigning each to bounds->lb(node); call TightenNodeLb/Ub (O(1)). "
                 "Pass 2 — schedule all remaining timed nodes in TopoSort(f) "
-                "order, assigning each to bounds->ub(node) (ALAP) so that "
-                "non-critical operations are deferred as late as possible. "
-                "After every assignment call bounds->TightenNodeLb/Ub and "
-                "bounds->PropagateBounds(). "
+                "order. For each node compute lb = max(bounds->lb(node), max "
+                "assigned_cycle of its timed operands) — O(degree). "
+                "Assign to bounds->ub(node) (ALAP, clamped to [lb, ub]) so that "
+                "non-critical operations are deferred as late as possible; "
+                "call TightenNodeLb/Ub (O(1)). "
+                "DO NOT call bounds->PropagateBounds() inside either pass — "
+                "it is O(n) per call and causes O(n²) total on 5000 nodes. "
                 "This two-pass strategy keeps the critical path tight while "
                 "minimising register pressure for non-critical values."
             ),
@@ -261,48 +292,67 @@ class IslandManager:
         # xls/scheduling/agent_generated_scheduler.cc.
         # Available APIs the variants can lean on:
         #   TopoSort(f), IsUntimed(node)
-        #   bounds->lb(node), bounds->ub(node)
-        #   bounds->TightenNodeLb/Ub(node, cycle), bounds->PropagateBounds()
+        #   bounds->lb(node), bounds->ub(node)        ← read from initial propagation
+        #   bounds->TightenNodeLb/Ub(node, cycle)     ← O(1), call after each assign
+        #   bounds->PropagateBounds()                  ← O(n), call ONCE before loop only
         #   delay_estimator.GetOperationDelayInPs(node)
         #   node->operands(), node->users(), node->GetType()->GetFlatBitCount()
+        #
+        # KEY: compute per-node lb as max(bounds->lb(node), max assigned_cycle of
+        # timed operands) — O(degree) — instead of calling PropagateBounds() per node.
         variants = {
             "agent_scheduler": [
                 # Variation 0: register-pressure-aware list scheduler
                 (
-                    "Implement a register-pressure-aware list scheduler. Visit nodes via "
-                    "TopoSort(f), skip IsUntimed(node), and for each node pick a cycle in "
-                    "[bounds->lb(node), bounds->ub(node)] that minimises boundary register "
-                    "cost — operands that would be registered across stage boundaries "
-                    "weighted by node->GetType()->GetFlatBitCount(), plus users that would "
-                    "be forced to later stages. After each placement call "
-                    "bounds->TightenNodeLb/Ub and bounds->PropagateBounds."
+                    "Implement a register-pressure-aware list scheduler. "
+                    "Call bounds->PropagateBounds() ONCE before the loop. "
+                    "Visit nodes via TopoSort(f), skip IsUntimed(node). "
+                    "For each node compute lb = max(bounds->lb(node), max assigned_cycle "
+                    "of its timed operands) — O(degree) — and ub = bounds->ub(node). "
+                    "Pick a cycle in [lb, ub] that minimises boundary register cost: "
+                    "operands registered across stage boundaries weighted by "
+                    "node->GetType()->GetFlatBitCount(), plus users forced to later stages. "
+                    "After each placement call bounds->TightenNodeLb/Ub (O(1) each). "
+                    "DO NOT call bounds->PropagateBounds() inside the loop — O(n) per call."
                 ),
                 # Variation 1: ASAP with delay-model tie-break
                 (
-                    "Implement an ASAP-first heuristic with delay-model tie-breaking. For "
-                    "each node in TopoSort order pick the earliest cycle in "
-                    "[bounds->lb(node), bounds->ub(node)]; among equally early cycles, "
-                    "prefer the one whose same-stage operands leave the most slack under "
-                    "clock_period_ps using delay_estimator.GetOperationDelayInPs(node). "
-                    "Always honour IsUntimed(node) and tighten bounds after each choice."
+                    "Implement an ASAP-first heuristic with delay-model tie-breaking. "
+                    "Call bounds->PropagateBounds() ONCE before the loop. "
+                    "For each node in TopoSort order compute lb = max(bounds->lb(node), "
+                    "max assigned_cycle of timed operands) — O(degree). "
+                    "Pick the earliest cycle in [lb, bounds->ub(node)]; among equally "
+                    "early cycles prefer the one whose same-stage operands leave the most "
+                    "slack under clock_period_ps using delay_estimator.GetOperationDelayInPs. "
+                    "Call TightenNodeLb/Ub after each choice (O(1)). "
+                    "DO NOT call bounds->PropagateBounds() inside the loop."
                 ),
                 # Variation 2: mobility-driven greedy
                 (
-                    "Implement a mobility-aware greedy scheduler. For each node compute "
-                    "mobility = bounds->ub(node) - bounds->lb(node) and handle low-mobility "
-                    "(critical) nodes first — schedule them ASAP for timing. For "
-                    "high-mobility wide nodes (big GetFlatBitCount, many users), push them "
-                    "to cycles that reduce live-out bits. Use bounds->TightenNodeLb/Ub and "
-                    "bounds->PropagateBounds() after every assignment."
+                    "Implement a mobility-aware greedy scheduler. "
+                    "Call bounds->PropagateBounds() ONCE before the loop. "
+                    "For each node compute mobility = bounds->ub(node) - bounds->lb(node) "
+                    "and handle low-mobility (critical) nodes first — schedule them ASAP. "
+                    "For high-mobility wide nodes (big GetFlatBitCount, many users), push "
+                    "them to cycles that reduce live-out bits. "
+                    "Compute per-node lb = max(bounds->lb(node), max assigned_cycle of "
+                    "timed operands) — O(degree). "
+                    "Call TightenNodeLb/Ub after each assignment (O(1)). "
+                    "DO NOT call bounds->PropagateBounds() inside the loop — it is O(n) "
+                    "per call and makes the scheduler O(n²) on 5000-node designs."
                 ),
                 # Variation 3: lookahead over candidate cycles
                 (
                     "Implement a deterministic multistage heuristic with lightweight "
-                    "lookahead: for each node iterate candidate_cycle in "
-                    "[bounds->lb(node), bounds->ub(node)] and score not just this node's "
-                    "placement but the pressure it adds for its users (use node->users() "
-                    "and their assigned cycles). Pick the lowest-score cycle, record it in "
-                    "the ScheduleCycleMap, and propagate bounds."
+                    "lookahead. Call bounds->PropagateBounds() ONCE before the loop. "
+                    "For each node in TopoSort order compute lb = max(bounds->lb(node), "
+                    "max assigned_cycle of timed operands) — O(degree). "
+                    "Iterate candidate_cycle in [lb, bounds->ub(node)] and score not just "
+                    "this node's placement but the pressure it adds for its users (use "
+                    "node->users() and their assigned cycles). "
+                    "Pick the lowest-score cycle, record it in the ScheduleCycleMap, "
+                    "call TightenNodeLb/Ub (O(1)). "
+                    "DO NOT call bounds->PropagateBounds() inside the loop."
                 ),
             ],
         }

@@ -1,6 +1,6 @@
 # AlphaEvolve-XLS — System Architecture
 
-> Last updated: 2026-04-18 — reflects agent-scheduler-only design, `--clock_period` CLI flag, optional baseline benchmark context, `--ppa_mode` behavior, `--benchmark_timeout` flag, runtime scoring, per-stage console callbacks, and slow-mode build-target optimisation.
+> Last updated: 2026-04-19 — reflects agent-scheduler-only design, `--clock_period` CLI flag, optional baseline benchmark context, `--ppa_mode` behavior, `--benchmark_timeout` flag, runtime scoring, per-stage console callbacks, slow-mode build-target optimisation, and `balance_cv_norm` stage-load distribution metric.
 
 This document is the reference for how AlphaEvolve-XLS is wired together internally. `README.md` is the user-facing guide; this file covers the internals.
 
@@ -101,10 +101,13 @@ alphaevolve-xls/
 │   │                                 2. block_metrics textproto (codegen, always)
 │   │                                 3. schedule textproto (tertiary)
 │   │                                 4. Verilog regex (last resort)
-│   │                               Score = stages * stage_weight
-│   │                                     + pipeline_flops * power_weight
-│   │                                     + area_um2 * area_weight
-│   │                                     + critical_path_ps * delay_weight.
+│   │                               Score (all terms normalized to [0,1]):
+│   │                                 (stages/ref_stages)          * stage_weight
+│   │                               + (flops/ref_flop_bits)        * flop_weight
+│   │                               + (area_um2/ref_area)          * area_weight
+│   │                               + (max_stage_delay/ref_clock)  * delay_weight
+│   │                               + balance_cv_norm              * balance_weight
+│   │                               + (runtime_s/ref_timeout)      * runtime_weight
 │   ├── database.py                 SQLite. Stores candidate, metrics, diff, status.
 │   ├── islands.py                  Island population manager. Only mutation_type
 │   │                               in use is "agent_scheduler"; each island picks
@@ -336,10 +339,13 @@ python run.py \
 │                               pipeline_stages, pipeline_reg_bits       │
 │     schedule textproto     → length, min_clock_period_ps               │
 │     Verilog regex          → approximate reg count (last resort)       │
-│   Score = stages * stage_weight                                        │
-│         + pipeline_flops * power_weight                                │
-│         + area_um2 * area_weight                                       │
-│         + critical_path_ps * delay_weight.                             │
+│   Score (all terms normalized to [0, 1] before weighting):            │
+│     (stages/ref_stages)         * stage_weight                        │
+│   + (flops/ref_flop_bits)       * flop_weight                         │
+│   + (area_um2/ref_area)         * area_weight                         │
+│   + (max_stage_delay/ref_clock) * delay_weight                        │
+│   + balance_cv_norm             * balance_weight  ← even load = lower │
+│   + (runtime_s/ref_timeout)     * runtime_weight                      │
 └────────────────────────────────────────────────────────────────────────┘
        │
        ▼
@@ -649,8 +655,15 @@ After each stage the spinner resets to "waiting for next stage..." until the nex
 The success line printed after a completed iteration shows all score components:
 
 ```
-✓ stages=<N>  area=<A>um²  delay=<D>ps  regs=<R>  runtime=<T>s  score=<S>  | build=<B>s
-    score = <N>×200 + <A>×1 + <D>×1 + <T>×1 = <S>
+✓ stages=<N>  area=<A>um²  max_stg_dly=<D>ps  bal_cv=<B>  regs=<R>  runtime=<T>s  score=<S>  | build=<B>s
+    score = stg(<n>)×W + dly(<d>)×W + bal(<b>)×W + area(<a>)×W + flp(<f>)×W + rt(<r>)×W = <S>
+```
+
+All six bracketed values are normalized ratios in [0, 1]. Example with `clock_period=25000`, iter6:
+
+```
+✓ stages=7  area=26065um²  max_stg_dly=16651ps  bal_cv=0.085  regs=0  runtime=1.2s  score=1.6476  | build=11s
+    score = stg(0.438)×1.0 + dly(0.666)×2.0 + bal(0.085)×1.5 + area(0.521)×0.2 + flp(0.000)×0.5 + rt(0.001)×0.5 = 1.6476
 ```
 
 ---
@@ -741,30 +754,57 @@ Placeholder modes emit a warning to stderr and then evaluate as if `fast`, so th
 
 ## Part 6 — Scoring
 
+All metrics are **normalized to [0, 1]** before weighting, eliminating unit mismatch between picoseconds, square-micrometers, and seconds. Lower score is better.
+
 ```
-Score = num_stages          * stage_weight
-      + pipeline_flops      * flop_weight
-      + area_um2            * area_weight
-      + critical_path_ps    * delay_weight
-      + scheduler_runtime_s * runtime_weight
+score = (num_stages           / REF_STAGES)    × stage_weight    ← penalise depth
+      + (effective_flop_bits  / REF_FLOP_BITS) × flop_weight     ← penalise register bits
+      + (total_area_um²       / REF_AREA_UM2)  × area_weight     ← penalise area
+      + (max_stage_delay_ps   / REF_CLOCK_PS)  × delay_weight    ← penalise tight stages
+      + balance_cv_norm                        × balance_weight  ← penalise uneven load
+      + (scheduler_runtime_s  / REF_TIMEOUT_S) × runtime_weight  ← penalise slow algos
 ```
 
-Lower is better. Defaults from `configs/evolve_config.yaml` (and `alphaevolve/ppa_metrics.py`):
+Defaults from `alphaevolve/ppa_metrics.py` (overridable via `configs/evolve_config.yaml`):
 
-| Weight           | Default | Notes                                                                                        |
-| ---------------- | ------- | -------------------------------------------------------------------------------------------- |
-| `stage_weight`   | 200     | Pipeline depth is the primary signal — always meaningful across all modes.                   |
-| `flop_weight`    | 0       | Pipeline flop bits as a proxy for switching-power cost. Off by default.                      |
-| `area_weight`    | 1       | Only meaningful with `ppa_mode=slow` (area comes from asap7 model). Otherwise area=0.        |
-| `delay_weight`   | 1       | Critical-path picoseconds from benchmark_main (slow) or block_metrics (fast).                |
-| `runtime_weight` | 1       | Scheduler wall-clock execution time in seconds, measured by benchmark_main. Only active in slow mode. A scheduler that times out (killed after `--benchmark_timeout` seconds) receives `runtime_s=3600` as a penalty, regardless of the actual timeout duration. This penalises O(n²) algorithms that would eventually produce valid PPA but are too slow to be useful. |
+| Parameter        | Default | Type      | Notes |
+| ---------------- | ------- | --------- | ----- |
+| `stage_weight`   | 1.0     | weight    | Pipeline depth penalty. |
+| `flop_weight`    | 0.5     | weight    | Pipeline register bit penalty. |
+| `area_weight`    | 0.2     | weight    | Combinational area rarely changes with scheduling; low weight. |
+| `delay_weight`   | 2.0     | weight    | Max stage delay penalty — primary differentiator between scheduler quality. |
+| `balance_weight` | 1.5     | weight    | Stage-load CV penalty. 0 = perfect balance; 1 = worst skew. |
+| `runtime_weight` | 0.5     | weight    | Scheduler wall-clock penalty. Timeout gives `runtime_s=3600` → normalized penalty of `3600/REF_TIMEOUT_S`. |
+| `ref_stages`     | 16      | reference | Set automatically from `pipeline_stages` in YAML if fixed. |
+| `ref_flop_bits`  | 10000   | reference | Max expected pipeline register bits. |
+| `ref_area_um2`   | 50000   | reference | Max expected combinational area (um²). |
+| `ref_clock_ps`   | —       | reference | **Set from `--clock_period`** each run. Must not be left at default 1000. |
+| `ref_timeout_s`  | 1800    | reference | Set from `--benchmark_timeout`. |
 
-`scheduler_runtime_s` is stored in `PPAMetrics.scheduler_runtime_s` and in the `Candidate` row. The `configure_scoring()` function in `ppa_metrics.py` lets the caller override any weight for the current process.
+**Key metric: `max_stage_delay_ps`**
+
+This is the maximum combinational delay across all pipeline stages, extracted from the `nodes: N, delay: Xps` lines in `benchmark_main` output. It replaces the old `critical_path_ps` (total design critical path) in the delay term. `critical_path_ps` was constant regardless of scheduling decisions; `max_stage_delay_ps` directly reflects how well the scheduler balanced stages.
+
+**Key metric: `balance_cv_norm` — stage load distribution**
+
+`balance_cv_norm` is the Coefficient of Variation (CV) of per-stage combinational delays, normalised to [0, 1]:
+
+```
+CV              = population_std(stage_delays) / mean(stage_delays)
+balance_cv_norm = CV / sqrt(N − 1)          # max CV for N stages is sqrt(N−1)
+```
+
+- **0** = all stages have identical delay — perfect balance, minimum contribution.
+- **1** = all delay in one stage — worst imbalance.
+
+This is independent from `max_stage_delay_ps`: two schedules can share the same maximum stage delay yet differ in `balance_cv_norm` if one has more nearly-empty stages.  The metric sees the full distribution, not just the peak.
+
+`configure_scoring()` in `ppa_metrics.py` accepts both weight and reference keyword arguments and can be called at any point to update the module globals for the current process.
 
 Aggregation across multiple designs (`evaluator._run_pipeline_on_designs`):
 
 - `total_stages`, `total_flops`, `total_area` are **summed** across designs.
-- `max_delay`, `max_min_clock`, and `max_runtime_s` are the **maximum** across designs.
+- `max_stage_delay`, `max_min_clock`, and `max_runtime_s` are the **maximum** across designs.
   (`max_runtime_s` uses the worst scheduler runtime across all designs, since the slowest design determines whether the iteration is practical.)
 
 ---
