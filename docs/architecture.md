@@ -55,6 +55,185 @@ Helper functions available to reuse: `NodeBitCount`, `NodeFanout`. The AI may ad
 
 ---
 
+## Part 1A — Inside `agent_generated_scheduler.cc`
+
+This section answers the practical questions: *What does the file look like? What is the AI actually replacing? Does the agent rewrite the whole file or just one function? How do its helper functions get incorporated?*
+
+---
+
+### File anatomy
+
+The file always has this five-zone structure:
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  Zone 1  Apache 2.0 license header + 13 #include directives        │
+│          Static. Evolution never touches these lines.               │
+└────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  Zone 2  namespace xls {                                            │
+│          One line. Static.                                          │
+└────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  Zone 3  Helper accumulation zone (grows over iterations)           │
+│                                                                    │
+│  One or more  namespace { ... }  // namespace  blocks.             │
+│  Always includes at least:                                         │
+│    int64_t NodeBitCount(Node* node)  — flat bit-width of a node    │
+│    int64_t NodeFanout(Node* node)    — downstream user count       │
+│  The AI may add more helpers here in each iteration.               │
+│  Old helper blocks from prior iterations accumulate and remain.    │
+└────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  Zone 4  THE ONLY ZONE THE AI REPLACES                              │
+│                                                                    │
+│  absl::StatusOr<ScheduleCycleMap> AgentGeneratedScheduler(          │
+│      FunctionBase* f, int64_t pipeline_stages,                     │
+│      int64_t clock_period_ps,                                      │
+│      const DelayEstimator& delay_estimator,                        │
+│      sched::ScheduleBounds* bounds,                                │
+│      absl::Span<const SchedulingConstraint> constraints) {         │
+│    // ... current implementation ...                               │
+│  }                                                                  │
+│                                                                    │
+│  _splice_function() replaces from the first character of the       │
+│  function signature all the way to the matching closing `}`.       │
+│  Everything else in the file is left untouched.                    │
+└────────────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  Zone 5  }  // namespace xls                                        │
+│          One line. Static.                                          │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### The baseline implementation
+
+The initial `AgentGeneratedScheduler()` body has two sections:
+
+**Section A — Dry-run stub (gated by `XLS_AGENT_DRY_RUN`)**
+
+```cpp
+if (std::getenv("XLS_AGENT_DRY_RUN") != nullptr) {
+    XLS_RETURN_IF_ERROR(bounds->PropagateBounds());
+    ScheduleCycleMap stub_map;
+    for (Node* node : TopoSort(f)) {
+        if (!IsUntimed(node)) stub_map[node] = bounds->lb(node);
+    }
+    return stub_map;
+}
+```
+
+This is a pure ASAP scheduler — every node is placed at its earliest legal cycle (`bounds->lb(node)`). It is only active when `--dry_run` is passed to `run.py`, which sets `XLS_AGENT_DRY_RUN` in the child process environment. The purpose is pipeline validation: you can run the entire ir_convert → opt → codegen → Verilog chain without spending AI tokens or waiting for a build.
+
+Because `_splice_function` replaces the *entire* function body (including this guard), the AI's output replaces the stub on every iteration. The stub is restored from backup after each evaluation (see `builder.restore()`), so it is always present in the on-disk file between iterations. It is absent only inside an active evaluation cycle.
+
+**Section B — The heuristic (the thing being evolved)**
+
+Below the dry-run guard is the live scheduler. In the initial baseline this is a simple ASAP greedy pass. Evolution replaces it with progressively more sophisticated scored list schedulers. The current evolved body (in `xls_patch/files/xls/scheduling/agent_generated_scheduler.cc`) uses a multi-factor cost function that weighs:
+- timing overflow (quadratic penalty for exceeding `clock_period_ps`)
+- register pressure (weighted bit-width of values that must cross a pipeline boundary)
+- stage load (node count per stage — lower variance is better)
+- criticality (fanout × bit-width / scheduling mobility)
+
+---
+
+### How `_splice_function` works (step by step)
+
+```python
+# evaluator.py — _splice_function(source, signature, new_body)
+#   source    = the full .cc file read from disk
+#   signature = "absl::StatusOr<ScheduleCycleMap> AgentGeneratedScheduler("
+#   new_body  = sanitized AI output (new helpers + function, no #include, no namespace xls)
+
+1.  Regex-find `signature` in `source`.
+2.  From the match start, scan forward to find the opening `{` of the function body.
+3.  Brace-count forward until depth returns to 0  →  brace_end  (the closing `}`).
+4.  Reconstruct:
+        before = source[ : match.start() ]      # Zone 1 + Zone 2 + Zone 3 (all helpers so far)
+        after  = source[ brace_end + 1 : ]      # "\n\n...\n}  // namespace xls"  (Zone 5)
+        result = before + new_body + "\n" + after
+```
+
+`before` contains Zones 1-3 entirely intact — license header, all 13 `#include` directives, `namespace xls {`, and every helper block accumulated from prior iterations.
+`after` contains Zone 5 — the trailing `} // namespace xls`.
+
+The AI output (`new_body`) lands in the gap between them.
+
+---
+
+### What the AI must produce
+
+The AI is given the current `.cc` file as context and must return a **drop-in replacement for Zone 4** — optionally with new Zone-3 helpers prepended:
+
+```cpp
+// Optional: new anonymous namespace block with helper functions
+namespace {
+int64_t MyHelper(Node* node, ...) { ... }
+// ...
+}  // namespace
+
+// Required: the target function, verbatim signature
+absl::StatusOr<ScheduleCycleMap> AgentGeneratedScheduler(
+    FunctionBase* f, int64_t pipeline_stages, int64_t clock_period_ps,
+    const DelayEstimator& delay_estimator, sched::ScheduleBounds* bounds,
+    absl::Span<const SchedulingConstraint> constraints) {
+  // ... new implementation body ...
+}
+```
+
+**`_sanitize_generated_code` enforces two rules before splicing:**
+
+| Rule | What it strips | Why |
+|------|----------------|-----|
+| No `#include` lines | All `#include ...` lines are removed | Zone 1 already has all necessary headers. Extra includes inside `namespace xls {}` are a compile error. |
+| No `namespace xls` wrapper | Leading `namespace xls { ... }` block is unwrapped | Zone 2 already opens `namespace xls`. Re-wrapping creates a nested redefinition. |
+
+If either stripping operation fires, a warning is logged and the sanitization note is recorded in the candidate database.
+
+---
+
+### Helper accumulation across iterations
+
+When the AI adds new helpers, they are prepended to `new_body`. After splicing:
+
+```
+... Zone 3 (all helpers from iterations 0…N-1) ...   ← part of "before", unchanged
+namespace {                                            ┐
+  // New helpers from iteration N                     │ start of new_body
+}  // namespace                                        ┘
+absl::StatusOr<ScheduleCycleMap> AgentGeneratedScheduler(...) {  ← rest of new_body
+  // New implementation
+}
+```
+
+Old helpers accumulate silently. They live in anonymous namespaces so there are no ODR (One Definition Rule) violations. Unused symbols are discarded by the linker. The growing "graveyard" of prior helper functions is visible to the AI in the current-source context; the prompt treats it as a form of evolutionary memory — the AI can see which helper patterns were tried before.
+
+---
+
+### Quick reference
+
+| Zone | Content | Changed by AI? |
+|------|---------|----------------|
+| License + `#include` | 13 XLS headers | ✗ Never |
+| `namespace xls {` | Opening brace | ✗ Never |
+| Helper namespaces | Accumulated `namespace {}` blocks | Grows (never shrinks) |
+| `AgentGeneratedScheduler()` | Full function: signature + body | **✓ Replaced every iteration** |
+| `}  // namespace xls` | Closing brace | ✗ Never |
+
+For the complete prompt the AI receives (system prompt, Jinja2 template, mutation instructions, injected variables), see **Part 3.2**.
+
+---
+
 ## Part 2 — File map
 
 ```
