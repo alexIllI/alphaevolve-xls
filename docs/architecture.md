@@ -36,16 +36,18 @@ The XLS BUILD dependency `//xls/scheduling:agent_generated_scheduler` is already
 
 ### The scheduler contract (what the AI must implement)
 
-1. Walk nodes via `TopoSort(f)`.
-2. Skip any node where `IsUntimed(node)` is true.
-3. Read the feasible window `[bounds->lb(node), bounds->ub(node)]`.
-4. Choose a cycle inside that window using a principled heuristic.
-5. Record the choice in a `ScheduleCycleMap` (`absl::flat_hash_map<Node*, int64_t>`).
-6. Pin it with `bounds->TightenNodeLb(node, cycle)` and `bounds->TightenNodeUb(node, cycle)`.
-7. Call `bounds->PropagateBounds()` after every assignment.
-8. Return the completed map.
+1. Call `bounds->PropagateBounds()` **once** before the main loop — O(n), initialises lb/ub windows.
+2. Walk nodes via `TopoSort(f)`.
+3. Skip any node where `IsUntimed(node)` is true.
+4. For each timed node, compute `lb = max(bounds->lb(node), max assigned_cycle of timed operands)`.
+5. Read `ub = bounds->ub(node)`. If `pipeline_stages > 0`, cap `ub = min(ub, pipeline_stages − 1)`.
+6. Choose a cycle in `[lb, ub]` using a principled heuristic.
+7. Record the choice in a `ScheduleCycleMap` (`absl::flat_hash_map<Node*, int64_t>`).
+8. Pin it with `bounds->TightenNodeLb(node, cycle)` and `bounds->TightenNodeUb(node, cycle)` — O(1) each.
+9. **Never** call `bounds->PropagateBounds()` inside the per-node loop — O(n) per call × ~4,919 nodes (SHA-256) = O(n²), reliably hits the 30-minute timeout.
+10. Return the completed map.
 
-Helper functions already defined in the file (`NodeBitCount`, `NodeFanout`, `EstimateBoundaryRegisterCost`, `ScoreCandidateCycle`) are available to reuse. The AI may add its own helpers inside a fresh anonymous namespace block above the target function.
+Helper functions available to reuse: `NodeBitCount`, `NodeFanout`. The AI may add its own helpers inside a fresh anonymous namespace block above the target function.
 
 ### Dry-run stub
 

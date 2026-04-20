@@ -7,13 +7,13 @@
 
 ## What This Is
 
-AlphaEvolve-XLS applies an AlphaEvolve-inspired evolutionary loop to automatically discover better pipeline scheduling algorithms inside [Google XLS](https://github.com/google/xls), an open-source High-Level Synthesis (HLS) toolchain.
+AlphaEvolve-XLS applies an AlphaEvolve-inspired evolutionary loop to automatically discover better pipeline scheduling algorithms inside [Google XLS](https://github.com/google/xls), an open-source High-Level Synthesis (HLS) toolchain. It targets a **forked XLS** that adds the `AgentGeneratedScheduler` dispatch point: **[github.com/alexIllI/xls](https://github.com/alexIllI/xls)**.
 
 In Google XLS, the scheduler sits between optimized IR and hardware generation. XLS first lowers DSLX into intermediate representation (IR), optimizes that IR, and then assigns each IR node to a pipeline cycle. That schedule decides where stage boundaries are inserted, how long values remain live across stages, and how many pipeline registers are needed. `codegen_main` then uses the schedule to emit pipelined Verilog and block metrics, while `benchmark_main` can estimate timing and area from the scheduled design. So the scheduler does not change what computation the IR performs, but it can strongly change latency, register pressure, timing balance, and sometimes final area.
 
 The project evolves exactly one C++ function: `AgentGeneratedScheduler()` in `xls/scheduling/agent_generated_scheduler.cc`. This file is a standalone scheduler that XLS dispatches when it is invoked with `--scheduling_strategy=agent`. Every other XLS built-in scheduler (SDC, min-cut, ASAP, random) is left untouched — we do not mutate them.
 
-Each iteration, the AI (Codex CLI or the OpenAI API) reads the current scheduler source, a bundle of reference XLS sources (SDC, min-cut, dispatch code) and provided knowledge, and emits a new C++ body that must respect the scheduler contract. The candidate is incrementally recompiled with Bazel, run against a set of DSLX benchmark designs, and scored on PPA (pipeline stages, register bits, area, critical-path delay). The best candidates become parents for the next generation. Details of the architecture are in [Overall Architecture](docs/architecture.md).
+Each iteration, the AI (Codex CLI or the OpenAI API) reads the current scheduler source, a bundle of reference XLS sources (SDC, min-cut, dispatch code) and provided knowledge, and emits a new C++ body that must respect the scheduler contract. The candidate is incrementally recompiled with Bazel, run against a set of DSLX benchmark designs, and scored on PPA (pipeline stages, register bits, area, max stage delay, and stage-load balance). The best candidates become parents for the next generation. Details of the architecture are in [Overall Architecture](docs/architecture.md).
 
 ### Scheduler contract
 
@@ -31,13 +31,16 @@ absl::StatusOr<ScheduleCycleMap> AgentGeneratedScheduler(
 
 And it must:
 
-1. Walk nodes via `TopoSort(f)` and skip anything `IsUntimed(node)`.
-2. Read the feasibility window `[bounds->lb(node), bounds->ub(node)]`.
-3. Pick a cycle inside that window using a principled heuristic.
-4. Record the choice in a `ScheduleCycleMap` (`absl::flat_hash_map<Node*, int64_t>`).
-5. Pin it via `bounds->TightenNodeLb/Ub(node, cycle)` and then `bounds->PropagateBounds()` after every assignment.
+1. Call `bounds->PropagateBounds()` **once** before the main loop — O(n), sets the initial lb/ub windows.
+2. Walk nodes via `TopoSort(f)` and skip anything `IsUntimed(node)`.
+3. For each timed node, compute `lb = max(bounds->lb(node), max assigned_cycle of timed operands)`.
+4. Read `ub = bounds->ub(node)`. If `pipeline_stages > 0`, cap `ub = min(ub, pipeline_stages − 1)`.
+5. Pick a cycle in `[lb, ub]` using a principled heuristic.
+6. Record the choice in a `ScheduleCycleMap` (`absl::flat_hash_map<Node*, int64_t>`).
+7. Pin it via `bounds->TightenNodeLb(node, cycle)` and `bounds->TightenNodeUb(node, cycle)` — O(1) each.
+8. **Never** call `bounds->PropagateBounds()` inside the per-node loop — that is O(n) per call × n nodes = O(n²), which times out on SHA-256's ~4,919 IR nodes.
 
-The helper functions already defined in the file (`NodeBitCount`, `NodeFanout`, `EstimateBoundaryRegisterCost`, `ScoreCandidateCycle`) are available to reuse.
+The helper functions already defined in the file (`NodeBitCount`, `NodeFanout`) are available to reuse. The AI may add its own helpers inside a fresh anonymous namespace block.
 
 ---
 
@@ -125,7 +128,11 @@ bazel build -c opt \
 bazel build -c opt //xls/dev_tools:benchmark_main
 ```
 
-> `benchmark_main` pulls in LLVM/JIT and is the largest target. For function-type designs (fir32, dot_product, gemm, idct, sha256, bitonic_sort, crc32) in `--ppa_mode fast` it is not needed. Build it once and use `--ppa_mode slow` when you need ASAP7 area/timing estimates or are running proc-type designs.
+> **⚠ First-build warning:** `benchmark_main` links against LLVM/JIT (~122 MB binary) and takes **20–40 minutes** to compile on a typical machine. This is a one-time cost — Bazel caches the result and subsequent incremental rebuilds (e.g. when the AI changes the scheduler) only relink the small scheduler object, taking ~3–5 seconds.
+>
+> If you interrupt the build partway through and later run `--ppa_mode slow`, the harness will resume the Bazel build from the partial cache, which may still take several minutes. Let it complete fully at least once before running experiments.
+>
+> For function-type designs (fir32, dot_product, gemm, idct, sha256, bitonic_sort, crc32) in `--ppa_mode fast`, `benchmark_main` is not needed at all.
 
 ### 3. Python environment
 
@@ -416,7 +423,7 @@ The first three iterations (0, 1, 2) always use **bootstrap instructions** — t
 | 1 | Stage-load balancer | Assigns each node to the least-loaded stage, producing a flat histogram of nodes per stage. |
 | 2 | Critical-path-first two-pass | Pass 1 schedules zero-mobility (critical) nodes ASAP; Pass 2 pushes all others ALAP. |
 
-From iteration 3 onwards, four rotating **variants** take over: register-pressure-aware, ASAP-with-tie-break, mobility-driven, and lookahead. All instructions include an explicit **complexity warning** about the sha256 benchmark's ~800 IR nodes, the 30-minute timeout, and the 3600s runtime penalty — requiring O(n×W) algorithms and banning O(n²) inner loops.
+From iteration 3 onwards, four rotating **variants** take over: register-pressure-aware, ASAP-with-tie-break, mobility-driven, and lookahead. All instructions include an explicit **complexity warning** about the sha256 benchmark's ~4,919 IR nodes, the 30-minute timeout, and the 3600s runtime penalty — requiring O(n×W) algorithms and banning O(n²) inner loops.
 
 All variants reference only real APIs (`TopoSort`, `IsUntimed`, `bounds->lb/ub`, `TightenNodeLb/Ub`, `PropagateBounds`, `delay_estimator.GetOperationDelayInPs`, `node->operands()`, `node->users()`, `GetFlatBitCount`).
 

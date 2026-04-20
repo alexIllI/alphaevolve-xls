@@ -38,23 +38,28 @@ max_build_retries: 3    # Per iteration: retry compile this many times with erro
 # + (max_stage_delay_ps / REF_CLOCK_PS)  * delay_weight
 # + balance_norm                         * balance_weight
 # + (runtime_s / REF_TIMEOUT_S)          * runtime_weight
-# Lower is better.
+# Lower is better. All terms are normalised to [0, 1] before weighting so
+# weights are directly comparable regardless of raw units (ps vs um² vs s).
 #
-# For scheduler evolution:
-# - `stage_weight` should stay modest. When the clock period and/or target stage
-#   count is already constrained by the user, stage count should not dominate.
-# - `power_weight` uses pipeline flop bits as an optional proxy only.
-# - `area_weight` is intentionally modest because scheduling changes area less
-#   directly than timing and balance.
-# - `reg_weight` is still accepted as a backward-compatible alias for
-#   `power_weight`.
-stage_weight: 0.25
-power_weight: 0
-area_weight: 1
-delay_weight: 1
+# Guidance:
+# - `stage_weight`: when pipeline_stages is fixed in ppa_constraints.yaml every
+#   candidate has the same stage count, making this a constant offset that does
+#   not help differentiation. Set to 0 (or keep very small) when stages are
+#   fixed. Only raise it when you want the scheduler to explore fewer stages.
+# - `power_weight`: uses pipeline flop bits as a proxy for register power.
+#   Set to 0 if you do not care about register count.
+# - `delay_weight`: the dominant signal for timing quality — how well the
+#   scheduler fits the critical stage within the clock period.
+# - `balance_weight`: penalises uneven stage-load distribution (CV of per-stage
+#   delays). Works alongside delay_weight; 0 = disable.
+# - `area_weight`: combinational area changes little with scheduling decisions;
+#   keep modest unless running in slow/Yosys mode.
+stage_weight: 0.0       # Set to 0 when pipeline_stages is fixed — it's a constant offset
+power_weight: 0.0       # Pipeline flop bits proxy; 0 = disabled
+area_weight: 1.0
+delay_weight: 1.0
 balance_weight: 1.5
 runtime_weight: 0.5
-reg_weight: 1           # Deprecated alias for power_weight
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log_level: "INFO"       # DEBUG | INFO | WARNING

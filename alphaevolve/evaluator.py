@@ -103,7 +103,7 @@ class Evaluator:
         if new_source is None:
             return self._make_failed(
                 iteration, island_id, parent_id, mutation_type,
-                target_file_rel, generated_code, original_source, original_source,
+                target_file_rel, generated_code, "",   # no diff — splice never ran
                 "run_failed", f"Could not locate function '{signature}' in {target_file_rel}",
                 t_start,
             )
@@ -286,6 +286,19 @@ class Evaluator:
                 max_runtime_s = max(max_runtime_s, result.benchmark_output.runtime_s)
 
             if not result.success:
+                # Surface the actual error so the attempt log and console carry
+                # a useful diagnostic rather than just "no design met constraints".
+                stage_label = result.error_stage or "pipeline"
+                stderr_snippet = (result.stderr or "").strip()
+                # First 400 chars is enough to identify the root cause.
+                if stderr_snippet:
+                    LOG.warning(
+                        "%s: %s failed — %s",
+                        design.stem, stage_label, stderr_snippet[:400],
+                    )
+                    timeout_errors.append(
+                        f"{design.stem}: {stage_label} failed — {stderr_snippet[:400]}"
+                    )
                 continue
 
             ppa = extract_ppa(

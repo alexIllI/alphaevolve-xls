@@ -224,12 +224,3 @@ fn idct_empty_test() {
   ];
   assert_eq(want, main(input))
 }
-bazel-bin/xls/dev_tools/benchmark_main \
-  /tmp/idct.opt.ir \
-  --delay_model=asap7 \
-  --area_model=asap7 \
-  --scheduling_strategy=sdc \
-  --run_evaluators=false \
-  --generator=pipeline \
-  --clock_period_ps=10000
-  > idct_benchmark.txt

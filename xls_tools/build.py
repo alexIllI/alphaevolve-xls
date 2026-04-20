@@ -157,11 +157,19 @@ class XLSBuilder:
 
     def build(self, targets: list[str] | None = None) -> BuildResult:
         """
-        Run an incremental Bazel build of the per-iteration targets only
-        (codegen_main, opt_main, ir_converter_main — NO benchmark_main).
-        Returns BuildResult with success flag, duration, and logs.
+        Run an incremental Bazel build of the given targets.
+        Defaults to ITERATION_TARGETS (codegen_main, opt_main, ir_converter_main)
+        when no targets are provided.
+
+        In slow mode the evaluator calls this twice per iteration with explicit
+        target lists:
+          1. ["//xls/scheduling:agent_generated_scheduler"]  — compile the AI C++
+          2. ["//xls/dev_tools:benchmark_main"]              — relink benchmark_main
+
+        The 30-minute timeout covers the rare case where benchmark_main needs a
+        partial LLVM relink from a warm-but-not-hot cache.
         """
-        return self._run_build(targets or self.ITERATION_TARGETS, timeout=900)  # 15 min max
+        return self._run_build(targets or self.ITERATION_TARGETS, timeout=1800)  # 30 min max
 
     def _run_build(self, targets: list[str], timeout: int) -> BuildResult:
         """Internal: run `bazel build -c opt -j N <targets>`."""

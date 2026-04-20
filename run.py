@@ -222,12 +222,19 @@ def main() -> int:
         )
 
     # Score tuning for scheduler evolution.
-    # `power_weight` is the preferred config name; `reg_weight` is kept as a
-    # backwards-compatible alias for the pipeline-flop proxy term.
-    # Reference values normalize raw metric units so weights are directly comparable.
+    # When pipeline_stages is fixed in ppa_constraints.yaml every candidate
+    # produces the same stage count, making the stage term a constant offset
+    # that cannot differentiate candidates.  Auto-zero stage_weight in that
+    # case unless the user has explicitly set it in evolve_config.yaml.
     _pipeline_stages = ppa_cfg.get("pipeline_stages")
+    _stage_weight_cfg = evo_cfg.get("stage_weight")
+    if _pipeline_stages is not None and _stage_weight_cfg is None:
+        # Stages fixed by config → stage term is constant for every candidate.
+        # Set weight to 0 automatically so it doesn't pollute the score signal.
+        _stage_weight_cfg = 0.0
+
     configure_scoring(
-        stage_weight=evo_cfg.get("stage_weight"),
+        stage_weight=_stage_weight_cfg,
         flop_weight=evo_cfg.get("power_weight", evo_cfg.get("reg_weight")),
         area_weight=evo_cfg.get("area_weight"),
         delay_weight=evo_cfg.get("delay_weight"),
@@ -255,7 +262,13 @@ def main() -> int:
     console.print(f"  AI backend       : [green]{evo_cfg['ai_backend']} / {evo_cfg['ai_model']}[/]")
     console.print(f"  Mutation targets : [green]{evo_cfg['mutation_types']}[/]")
     console.print(f"  Clock period     : [green]{args.clock_period} ps[/]")
+    console.print(f"  Pipeline stages  : [green]{'fixed → ' + str(_pipeline_stages) if _pipeline_stages else 'free (scheduler decides)'}[/]")
     console.print(f"  PPA mode         : [green]{ppa_mode}[/]")
+    if _pipeline_stages is not None and _ppa_mod.STAGE_WEIGHT == 0.0:
+        console.print(
+            "  [dim]stage_weight auto-zeroed: pipeline_stages is fixed, so the stage term "
+            "is a constant across all candidates and cannot aid ranking.[/]"
+        )
     console.print(
         "  Score formula    : "
         f"[green]"
@@ -420,6 +433,19 @@ def main() -> int:
     from alphaevolve.ppa_metrics import PPAMetrics
 
     db_path = output_dir / "candidates_db.sqlite"
+    if db_path.exists():
+        # Archive the old database so the new run starts clean.
+        # Previous results are preserved in the archive file; the Top-3
+        # table and evolution_log.csv will only reflect the current run.
+        from datetime import datetime as _dt
+        _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+        _archive = db_path.with_name(f"candidates_db_{_ts}.sqlite")
+        db_path.rename(_archive)
+        console.print(
+            f"  [yellow]⚠ Output directory already contains a previous run.[/]\n"
+            f"  [dim]Old database archived → {_archive.name}[/]\n"
+            f"  [dim]Starting fresh — results below are from this run only.[/]"
+        )
     db = CandidateDB(db_path)
 
     sampler = Sampler(

@@ -233,7 +233,14 @@ class XLSPipeline:
         _t = _time.monotonic()
         result = self._run(ir_cmd)
         if result.returncode != 0:
-            _notify("ir_convert", "failed", _t, dslx_file.name)
+            # Surface the first meaningful error line so the user can diagnose
+            # without digging into attempt logs.
+            err_lines = [
+                ln.strip() for ln in (result.stderr or result.stdout).splitlines()
+                if ln.strip() and not ln.startswith("bazel") and not ln.startswith("INFO")
+            ]
+            err_hint = err_lines[0][:120] if err_lines else "no output"
+            _notify("ir_convert", "failed", _t, f"{dslx_file.name} — {err_hint}")
             return _fail("ir_convert", result)
 
         ir_text = result.stdout
