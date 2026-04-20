@@ -21,7 +21,7 @@ delay_model: "asap7"
 
 # Force a fixed number of pipeline stages (null = let the scheduler decide).
 # Set to an integer to constrain the search (e.g. 3 means exactly 3 stages).
-pipeline_stages: 8
+pipeline_stages: 64
 
 # Codegen mode: 'pipeline' (multi-stage) or 'combinational' (single stage).
 # Must be 'pipeline' for multi-stage PPA evaluation.

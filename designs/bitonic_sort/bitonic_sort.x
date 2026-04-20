@@ -34,7 +34,7 @@ fn swap<B: u32, N: u32>(array: uN[B][N], i: u32, j: u32) -> uN[B][N] {
     update(update(array, i, j_element), j, i_element)
 }
 
-fn bitonic_sort<N: u32, LOG_N: u32 = { std::clog2(N) }>(array: u32[N]) -> u32[N] {
+pub fn bitonic_sort<N: u32, LOG_N: u32 = { std::clog2(N) }>(array: u32[N]) -> u32[N] {
     const_assert!(std::is_pow2(N));
     let (result, _) = for (_, (array, k)) in u32:0..LOG_N {
         let (result, _) = for (_, (array, j)) in u32:0..LOG_N {

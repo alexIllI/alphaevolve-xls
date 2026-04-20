@@ -223,6 +223,10 @@ class XLSPipeline:
         ir_cmd = [self._require_bin("ir_converter_main"), str(dslx_file)]
         if self.dslx_stdlib_path:
             ir_cmd += [f"--dslx_stdlib_path={self.dslx_stdlib_path}"]
+        # Multi-file DSLX designs resolve local imports via --dslx_path.
+        # Without this, wrapper modules such as bitonic_sort_wrapper.x fail
+        # immediately in ir_convert even when the imported sibling module exists.
+        ir_cmd += [f"--dslx_path={dslx_file.parent}"]
         if dslx_top:
             ir_cmd += [f"--top={dslx_top}"]   # sets package top in the IR
         _notify_start("ir_convert", dslx_file.name)
