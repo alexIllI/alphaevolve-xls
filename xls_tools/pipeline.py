@@ -325,8 +325,8 @@ class XLSPipeline:
 
             parsed = parse_benchmark_stdout(bm_text)
             parsed.runtime_s = actual
+            parsed.raw_stdout = bm_text
             if parsed.critical_path_ps > 0 or parsed.num_stages > 0 or "Pipeline:" in bm_text:
-                parsed.raw_stdout = bm_text
                 _notify("AI scheduler", "ok", _bt,
                         f"delay_model={delay_model}  area_model={area_model}  "
                         f"runtime={actual:.1f}s")

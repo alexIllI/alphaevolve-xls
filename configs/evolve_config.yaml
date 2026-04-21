@@ -54,9 +54,9 @@ max_build_retries: 3    # Per iteration: retry compile this many times with erro
 #   delays). Works alongside delay_weight; 0 = disable.
 # - `area_weight`: combinational area changes little with scheduling decisions;
 #   keep modest unless running in slow/Yosys mode.
-stage_weight: 0.0       # Set to 0 when pipeline_stages is fixed — it's a constant offset
-power_weight: 0.0       # Pipeline flop bits proxy; 0 = disabled
-area_weight: 1.0
+stage_weight: 0.5       # Set to 0 when pipeline_stages is fixed — it's a constant offset
+power_weight: 0.01       # Pipeline flop bits proxy; 0 = disabled
+area_weight: 0.0
 delay_weight: 1.0
 balance_weight: 1.5
 runtime_weight: 0.5

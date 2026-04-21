@@ -701,7 +701,7 @@ def main() -> int:
             if c.build_status == "success":
                 last_compile_error = None
                 last_attempt_feedback = None
-                break   # ??compiled and scheduled ??exit retry loop
+                break   # ✓ compiled and scheduled — exit retry loop
 
             # ── run_failed: scheduler compiled but produced no feasible schedule ─
             # Don't retry as a "compile error" — the C++ was valid; the schedule

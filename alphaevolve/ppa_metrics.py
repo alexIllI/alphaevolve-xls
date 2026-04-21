@@ -60,7 +60,7 @@ if TYPE_CHECKING:
 # All positive: higher normalized value → worse (higher) score.
 STAGE_WEIGHT   = 0.0   # pipeline depth:       fewer stages   → lower score
 FLOP_WEIGHT    = 0.5   # pipeline register bits: fewer flops  → lower score
-AREA_WEIGHT    = 0.2   # combinational area:    rarely changes with scheduling
+AREA_WEIGHT    = 0.0   # combinational area:    rarely changes with scheduling
 DELAY_WEIGHT   = 2.0   # max stage delay:       lower delay   → lower score
 BALANCE_WEIGHT = 1.5   # stage load CV:         even spread   → lower score (0=perfect)
 RUNTIME_WEIGHT = 0.5   # scheduler wall time:   faster algo   → lower score

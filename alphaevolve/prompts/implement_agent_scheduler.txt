@@ -65,6 +65,30 @@ Use them as a reference to understand what PPA your algorithm should aim to beat
 {{ baseline_benchmark_context }}
 {% endif %}
 
+{% if previous_attempt_feedback %}
+== PREVIOUS ATTEMPT FAILED TO PRODUCE USEFUL PPA ==
+Status: {{ previous_attempt_feedback.status }}
+Reason: {{ previous_attempt_feedback.reason }}
+{% if previous_attempt_feedback.num_stages is not none %}
+Observed stage count: {{ previous_attempt_feedback.num_stages }}
+{% endif %}
+{% if previous_attempt_feedback.min_clock_period_ps is not none %}
+Observed minimum feasible clock: {{ previous_attempt_feedback.min_clock_period_ps }} ps
+{% endif %}
+{% if previous_attempt_feedback.max_stage_delay_ps is not none %}
+Observed max stage delay: {{ previous_attempt_feedback.max_stage_delay_ps }} ps
+{% endif %}
+{% if previous_attempt_feedback.runtime_s is not none %}
+Observed scheduler runtime: {{ '%.1f' | format(previous_attempt_feedback.runtime_s) }} s
+{% endif %}
+{% if previous_attempt_feedback.likely_under_pipelined %}
+Diagnosis: likely under-pipelined at the requested clock. Spread nodes across more stages / later legal cycles instead of over-packing early stages.
+{% endif %}
+{% if previous_attempt_feedback.guidance %}
+Guidance: {{ previous_attempt_feedback.guidance }}
+{% endif %}
+{% endif %}
+
 == MUTATION INSTRUCTION ==
 {{ mutation_instruction }}
 
