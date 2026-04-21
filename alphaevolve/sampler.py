@@ -67,6 +67,7 @@ class Sampler:
         knowledge_keys: list[str] | None = None,
         baseline_benchmark_context: str | None = None,  # from design/<name>_benchmark.txt
         compile_error: str | None = None,   # set on retry so AI can fix its mistake
+        previous_attempt_feedback: dict | None = None,
         target_file_path: str = "",
     ) -> str:
         """Generate a new C++ implementation. Returns the raw C++ string."""
@@ -98,6 +99,7 @@ class Sampler:
             knowledge_context=knowledge_context,
             baseline_benchmark_context=baseline_benchmark_context,
             compile_error=compile_error,    # None on first attempt
+            previous_attempt_feedback=previous_attempt_feedback,
             target_file_path=target_file_path,
         )
 

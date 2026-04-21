@@ -1,4 +1,4 @@
-"""
+﻿"""
 alphaevolve/evaluator.py
 ────────────────────────
 Orchestrates one full evaluation cycle for a candidate:
@@ -45,6 +45,7 @@ class EvalResult:
     ppa: PPAMetrics
     build_result: BuildResult | None = None
     pipeline_result: PipelineResult | None = None
+    retry_feedback: dict | None = None
     error: str = ""
 
 
@@ -118,6 +119,7 @@ class Evaluator:
         build_result: BuildResult | None = None
         aggregate_ppa = PPAMetrics(feasible=False)
         error_msg = ""
+        retry_feedback: dict | None = None
 
         try:
             # ── Build ─────────────────────────────────────────────────────────
@@ -206,6 +208,7 @@ class Evaluator:
             candidate=candidate,
             ppa=aggregate_ppa,
             build_result=build_result,
+            retry_feedback=retry_feedback,
         )
 
     # ── Internal helpers ───────────────────────────────────────────────────────
@@ -216,7 +219,7 @@ class Evaluator:
         island_id: int,
         on_stage_start=None,
         on_stage=None,
-    ) -> tuple[PPAMetrics, str]:
+    ) -> tuple[PPAMetrics, str, dict | None]:
         """
         Run the XLS pipeline on all benchmark designs and aggregate PPA.
 
@@ -239,6 +242,7 @@ class Evaluator:
         max_runtime_s   = 0.0   # worst scheduler runtime across all designs
         any_feasible = False
         timeout_errors: list[str] = []
+        retry_feedbacks: list[dict] = []
 
         per_design_overrides = self.ppa_constraints.get("per_design", {})
         n_designs = len(self.design_files)
@@ -278,6 +282,19 @@ class Evaluator:
                 LOG.warning(msg)
                 timeout_errors.append(msg)
                 max_runtime_s = max(max_runtime_s, 3600.0)
+                retry_feedbacks.append({
+                    "status": "timeout",
+                    "reason": msg,
+                    "num_stages": None,
+                    "min_clock_period_ps": None,
+                    "max_stage_delay_ps": None,
+                    "runtime_s": float(exc.timeout),
+                    "likely_under_pipelined": False,
+                    "guidance": (
+                        "Keep the heuristic bounded. Avoid repeated global rescoring "
+                        "or expensive propagation-heavy multi-pass search."
+                    ),
+                })
                 continue
 
             # Always capture runtime from benchmark_output, even on failure.
@@ -299,6 +316,14 @@ class Evaluator:
                     timeout_errors.append(
                         f"{design.stem}: {stage_label} failed — {stderr_snippet[:400]}"
                     )
+                retry_feedback = self._make_retry_feedback(
+                    design=design,
+                    requested_clock_ps=cstr.get("clock_period_ps", 1000),
+                    pipeline_stages=cstr.get("pipeline_stages"),
+                    result=result,
+                )
+                if retry_feedback is not None:
+                    retry_feedbacks.append(retry_feedback)
                 continue
 
             ppa = extract_ppa(
@@ -321,7 +346,11 @@ class Evaluator:
 
         if not any_feasible:
             err = "; ".join(timeout_errors) if timeout_errors else "no design met constraints"
-            return PPAMetrics(feasible=False, scheduler_runtime_s=max_runtime_s), err
+            return (
+                PPAMetrics(feasible=False, scheduler_runtime_s=max_runtime_s),
+                err,
+                self._select_retry_feedback(retry_feedbacks),
+            )
 
         # If stage-level delays were parsed (slow mode), use the per-stage max.
         # Fall back to the full-design critical-path header when not available.
@@ -340,7 +369,94 @@ class Evaluator:
             feasible=True,
         )
         agg._compute()
-        return agg, ""
+        return agg, "", None
+
+    @staticmethod
+    def _parse_clock_suggestion(text: str) -> int | None:
+        if not text:
+            return None
+        for pattern in (
+            r"Min clock period ps:\s*(\d+)",
+            r"--clock_period_ps=(\d+)",
+        ):
+            match = re.search(pattern, text)
+            if match:
+                return int(match.group(1))
+        return None
+
+    def _make_retry_feedback(
+        self,
+        design: Path,
+        requested_clock_ps: int,
+        pipeline_stages: int | None,
+        result: PipelineResult,
+    ) -> dict | None:
+        bm = result.benchmark_output
+        raw = bm.raw_stdout if bm and bm.raw_stdout else ""
+        reason = (result.stderr or "").strip() or f"{result.error_stage or 'pipeline'} failed"
+
+        min_clock_period_ps = None
+        max_stage_delay_ps = None
+        num_stages = None
+        runtime_s = None
+        if bm is not None:
+            min_clock_period_ps = (
+                bm.min_clock_period_ps if bm.min_clock_period_ps > 0 else self._parse_clock_suggestion(raw)
+            )
+            max_stage_delay_ps = bm.max_stage_delay_ps if bm.max_stage_delay_ps > 0 else None
+            num_stages = bm.num_stages if bm.num_stages > 0 else None
+            runtime_s = bm.runtime_s if bm.runtime_s > 0 else None
+
+        likely_under_pipelined = False
+        guidance_parts: list[str] = []
+        if min_clock_period_ps is not None and min_clock_period_ps > requested_clock_ps:
+            likely_under_pipelined = True
+            guidance_parts.append(
+                f"Requested clock is {requested_clock_ps}ps but the observed minimum feasible clock was {min_clock_period_ps}ps."
+            )
+        if max_stage_delay_ps is not None and max_stage_delay_ps > requested_clock_ps:
+            likely_under_pipelined = True
+            guidance_parts.append(
+                f"Observed max stage delay {max_stage_delay_ps}ps exceeds the requested {requested_clock_ps}ps."
+            )
+        if likely_under_pipelined:
+            if pipeline_stages is None:
+                guidance_parts.append(
+                    "Choose later legal cycles more aggressively so the schedule naturally uses more stages."
+                )
+            else:
+                guidance_parts.append(
+                    f"Redistribute work more evenly across the fixed {pipeline_stages} stages."
+                )
+        if runtime_s is not None and runtime_s >= max(30.0, self.pipeline.benchmark_timeout * 0.8):
+            guidance_parts.append(
+                "The heuristic is also too slow; keep per-node scoring bounded and avoid repeated heavy recomputation."
+            )
+
+        return {
+            "status": result.error_stage or "pipeline_failed",
+            "reason": f"{design.stem}: {reason[:400]}",
+            "num_stages": num_stages,
+            "min_clock_period_ps": min_clock_period_ps,
+            "max_stage_delay_ps": max_stage_delay_ps,
+            "runtime_s": runtime_s,
+            "likely_under_pipelined": likely_under_pipelined,
+            "guidance": " ".join(guidance_parts) if guidance_parts else None,
+        }
+
+    @staticmethod
+    def _select_retry_feedback(feedbacks: list[dict]) -> dict | None:
+        if not feedbacks:
+            return None
+
+        def _score(item: dict) -> tuple[int, int, int]:
+            return (
+                1 if item.get("likely_under_pipelined") else 0,
+                1 if item.get("min_clock_period_ps") is not None else 0,
+                1 if item.get("max_stage_delay_ps") is not None else 0,
+            )
+
+        return max(feedbacks, key=_score)
 
     @staticmethod
     def _sanitize_generated_code(generated_code: str) -> tuple[str, list[str]]:

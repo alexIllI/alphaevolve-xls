@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 run.py — AlphaEvolve-XLS Main Entry Point
 ──────────────────────────────────────────
@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import logging
 import os
@@ -298,6 +299,10 @@ def main() -> int:
         xls_src=xls_src,
         bazel_jobs=evo_cfg.get("bazel_jobs", 8),
     )
+    # Restore any .bak files if we exit unexpectedly (Ctrl+C, crash, etc.).
+    # restore() is a no-op when _backups is already empty (normal exit path),
+    # so registering it unconditionally is always safe.
+    atexit.register(builder.restore)
 
     # Determine binary paths
     bazel_bin = xls_src / "bazel-bin" / "xls" / "tools"
@@ -328,17 +333,35 @@ def main() -> int:
     # benchmark_main is only needed for ppa_mode in ("slow", "slowest").
     needs_benchmark_main = ppa_mode in ("slow", "slowest")
 
-    # ── Ensure static tools are built once (benchmark_main, etc.) ────────────
+    def _print_build_error(result: "BuildResult", label: str) -> None:
+        """Print the most useful portion of a failed Bazel stderr."""
+        stderr = result.stderr or ""
+        # Extract lines that contain actual errors (skip INFO/progress spam).
+        error_lines = [
+            ln for ln in stderr.splitlines()
+            if any(kw in ln for kw in ("ERROR:", "error:", "/bin/bash", "$'\\r'", "FAILED", "WARNING:"))
+        ]
+        if error_lines:
+            snippet = "\n".join(error_lines[:30])  # first 30 error lines
+        else:
+            snippet = stderr[-600:]  # fallback: last 600 chars
+        console.print(f"[red]{label} build failed.[/]")
+        console.print(f"  [dim]{snippet}[/]")
+        console.print(
+            f"  [dim]Tip: for full details run:[/] "
+            f"[bold]cd {xls_src} && bazel build -c opt --verbose_failures <target>[/]"
+        )
+
+    # ?? Ensure static tools are built once (benchmark_main, etc.) ????????????
     bm_path = xls_src / "bazel-bin" / "xls" / "dev_tools" / "benchmark_main"
     if needs_benchmark_main:
         if not bm_path.exists():
             console.print("[yellow]benchmark_main not found — building static targets (one-time, may take a while)...[/]")
             static_result = builder.build_static()
             if not static_result.success:
-                console.print("[red]WARNING:[/] benchmark_main build failed — area metrics unavailable.")
-                console.print(f"  [dim]{static_result.stderr[-300:]}[/]")
+                _print_build_error(static_result, "benchmark_main")
             else:
-                console.print(f"[green]✓[/] Static tools built in {static_result.duration_seconds:.0f}s")
+                console.print(f"[green]?/] Static tools built in {static_result.duration_seconds:.0f}s")
         else:
             console.print(f"[dim]benchmark_main already built, skipping static build[/]")
     else:
@@ -356,8 +379,7 @@ def main() -> int:
         console.print("[yellow]Building XLS runtime tools required for the evolution loop...[/]")
         static_result = builder.build_bootstrap(include_benchmark_main=False)
         if not static_result.success:
-            console.print("[red]WARNING:[/] XLS runtime bootstrap build failed.")
-            console.print(f"  [dim]{static_result.stderr[-300:]}[/]")
+            _print_build_error(static_result, "XLS runtime bootstrap")
         else:
             console.print(f"[green]✓[/] XLS runtime tools built in {static_result.duration_seconds:.0f}s")
 
@@ -561,6 +583,7 @@ def main() -> int:
 
         max_retries = evo_cfg.get("max_build_retries", 3)
         last_compile_error: str | None = None
+        last_attempt_feedback: dict | None = None
         result = None
 
         # Per-iteration attempt log — written for every attempt so post-run
@@ -593,6 +616,7 @@ def main() -> int:
                     pipeline_stages=ppa_cfg.get("pipeline_stages"),
                     baseline_benchmark_context=baseline_benchmark_context or None,
                     compile_error=last_compile_error,   # None on first attempt
+                    previous_attempt_feedback=last_attempt_feedback,
                     target_file_path=target_file_rel,
                 )
             except Exception as e:
@@ -675,19 +699,30 @@ def main() -> int:
             )
 
             if c.build_status == "success":
-                break   # ✓ compiled and scheduled — exit retry loop
+                last_compile_error = None
+                last_attempt_feedback = None
+                break   # ??compiled and scheduled ??exit retry loop
 
             # ── run_failed: scheduler compiled but produced no feasible schedule ─
             # Don't retry as a "compile error" — the C++ was valid; the schedule
             # is infeasible for this clock period / design.  Stop retrying now so
             # we don't waste two more AI calls mislabelled as compile fixes.
             if c.build_status == "run_failed":
+                last_compile_error = None
+                last_attempt_feedback = result.retry_feedback
+                if attempt < max_retries and last_attempt_feedback:
+                    console.print(
+                        f"  [yellow]??schedule/run failed (attempt {attempt}/{max_retries}), "
+                        f"sending timing/stage feedback to AI for retry...[/]"
+                    )
+                    continue
                 break
 
             # ── build_failed: compiler/linker rejected the C++ ───────────────
             # Build the error string fed back to the AI on the next attempt.
             # Keep more context than just error:/note: lines so the AI can
             # locate the offending construct (include surrounding lines too).
+            last_attempt_feedback = None
             raw_error = c.notes or "Build failed (no error details)"
             if "error:" in raw_error:
                 error_lines = raw_error.splitlines()
@@ -834,4 +869,12 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # Ctrl+C pressed ??atexit handlers (including builder.restore) will
+        # run automatically during Python shutdown.  Just suppress the traceback.
+        print("\n\n?? Evolution interrupted by user (Ctrl+C).")
+        print("   Any in-progress source backup has been restored.")
+        sys.exit(130)  # 130 = 128 + SIGINT(2), standard shell convention
+
