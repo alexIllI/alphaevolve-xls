@@ -10,7 +10,7 @@ Priority / source hierarchy:
      → flop_count (XLS-internal accurate), per-type delay breakdown
   3. Verilog regex fallback (tertiary) — approximate register counting
 
-PPA Score (lower = better, all terms normalized to [0, 1] before weighting):
+PPA Score (lower = better, all terms are unit-free before weighting):
 
     score = (num_stages           / REF_STAGES)    * STAGE_WEIGHT    ← penalise depth
           + (effective_flop_count / REF_FLOP_BITS) * FLOP_WEIGHT     ← penalise reg bits
@@ -157,12 +157,16 @@ class PPAMetrics:
         n = len(delays)
         if n <= 1:
             return 0.0
-        mean = sum(delays) / n
-        if mean == 0.0:
+        utilizations = [d / max(1, REF_CLOCK_PS) for d in delays]
+        mean_u = sum(utilizations) / n
+        if mean_u == 0.0:
             return 0.0
-        variance = sum((d - mean) ** 2 for d in delays) / n
-        cv = math.sqrt(variance) / mean
-        return min(cv / math.sqrt(n - 1), 1.0)
+        variance = sum((u - mean_u) ** 2 for u in utilizations) / n
+        spread = math.sqrt(variance)
+        overload = math.sqrt(
+            sum(max(0.0, u - 1.0) ** 2 for u in utilizations) / n
+        )
+        return spread + 2.0 * overload
 
     def normalized_terms(self) -> dict[str, float]:
         """Return each score term as a normalized ratio in [0, 1].

@@ -166,7 +166,7 @@ class Evaluator:
                 )
             else:
                 # ── Run XLS pipeline on all benchmark designs ─────────────────
-                aggregate_ppa, error_msg = self._run_pipeline_on_designs(
+                aggregate_ppa, error_msg, retry_feedback = self._run_pipeline_on_designs(
                     iteration, island_id,
                     on_stage_start=on_stage_start,
                     on_stage=on_stage,

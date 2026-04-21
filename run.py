@@ -29,6 +29,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -178,6 +179,65 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING"],
     )
     return parser.parse_args()
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _extract_current_function(source: str, signature: str) -> str:
+    """
+    Return only the live function + its most recent helper namespace block.
+
+    After many successful iterations, agent_generated_scheduler.cc grows a
+    graveyard of dead anonymous-namespace helper blocks from prior generations.
+    Sending the whole file to the AI wastes tokens, eventually overflows the
+    context window, and causes the model to emit degenerate output (pseudocode)
+    instead of valid C++.
+
+    This function extracts:
+      - The last `namespace { ... }` block immediately before the function
+        signature (the helpers the current implementation actually uses), and
+      - The function itself (signature + body), found via brace counting.
+
+    If extraction fails for any reason it falls back to returning the full
+    source unchanged, so this is always safe to call.
+    """
+    # Isolate the function by its short name (e.g. "AgentGeneratedScheduler")
+    fn_name = signature.strip().split("(")[0].rsplit(None, 1)[-1]
+    match = re.search(re.escape(fn_name), source)
+    if not match:
+        return source  # fallback
+
+    before_fn = source[: match.start()]
+
+    # Walk backwards to find the last `namespace {` opener before the function.
+    # That block contains the helpers the current implementation uses.
+    last_ns = before_fn.rfind("\nnamespace {")
+    extract_start = (last_ns + 1) if last_ns != -1 else match.start()
+
+    # Find the function's closing brace via brace counting.
+    brace_start = source.find("{", match.start())
+    if brace_start == -1:
+        return source  # fallback
+    depth, brace_end = 0, brace_start
+    for i in range(brace_start, len(source)):
+        if source[i] == "{":
+            depth += 1
+        elif source[i] == "}":
+            depth -= 1
+            if depth == 0:
+                brace_end = i
+                break
+
+    extracted = source[extract_start : brace_end + 1]
+
+    if extract_start > 0:
+        omitted_lines = source[:extract_start].count("\n")
+        extracted = (
+            f"// [Earlier helper generations omitted: {omitted_lines} lines of"
+            " accumulated dead code from prior iterations]\n\n" + extracted
+        )
+
+    return extracted
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -513,7 +573,11 @@ def main() -> int:
         refs: list[tuple[str, str]] = []
         if mutation_type == "agent_scheduler":
             refs = [
-                ("Current standalone scheduler", "xls/scheduling/agent_generated_scheduler.cc"),
+                # NOTE: "Current standalone scheduler" is intentionally absent here.
+                # The live function (trimmed to the active implementation) is already
+                # injected as {{ current_source }} in the prompt template.  Including
+                # the full file again in the reference bundle would send the entire
+                # accumulated graveyard of dead helpers twice, doubling context waste.
                 ("SDC scheduler", "xls/scheduling/sdc_scheduler.cc"),
                 ("Min-cut scheduler", "xls/scheduling/min_cut_scheduler.cc"),
                 ("Scheduler dispatch", "xls/scheduling/run_pipeline_schedule.cc"),
@@ -568,8 +632,13 @@ def main() -> int:
         mutation_type = island.mutation_type
         target_file_rel, signature = MUTATION_TARGETS[mutation_type]
 
-        # Get current function source
-        current_source = (xls_src / target_file_rel).read_text(encoding="utf-8")
+        # Read the full source file, then extract only the live function and
+        # its most recent helper namespace.  The full file accumulates dead
+        # helper blocks from every prior successful iteration; sending that
+        # graveyard to the AI wastes context tokens and, once it grows large
+        # enough, causes the model to emit pseudocode instead of valid C++.
+        _full_source = (xls_src / target_file_rel).read_text(encoding="utf-8")
+        current_source = _extract_current_function(_full_source, signature)
         reference_source_bundle = build_reference_source_bundle(mutation_type)
 
         mutation_instruction = island_mgr.mutation_instruction_for(island, iteration)
@@ -712,7 +781,7 @@ def main() -> int:
                 last_attempt_feedback = result.retry_feedback
                 if attempt < max_retries and last_attempt_feedback:
                     console.print(
-                        f"  [yellow]??schedule/run failed (attempt {attempt}/{max_retries}), "
+                        f"  [yellow]⟳ schedule/run failed (attempt {attempt}/{max_retries}), "
                         f"sending timing/stage feedback to AI for retry...[/]"
                     )
                     continue
@@ -872,9 +941,9 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        # Ctrl+C pressed ??atexit handlers (including builder.restore) will
+        # Ctrl+C pressed -> atexit handlers (including builder.restore) will
         # run automatically during Python shutdown.  Just suppress the traceback.
-        print("\n\n?? Evolution interrupted by user (Ctrl+C).")
+        print("\n\n⚠ Evolution interrupted by user (Ctrl+C).")
         print("   Any in-progress source backup has been restored.")
         sys.exit(130)  # 130 = 128 + SIGINT(2), standard shell convention
 
