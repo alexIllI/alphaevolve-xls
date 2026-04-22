@@ -894,7 +894,7 @@ score = (num_stages           / REF_STAGES)    × stage_weight    ← penalise d
       + (effective_flop_bits  / REF_FLOP_BITS) × flop_weight     ← penalise register bits
       + (total_area_um²       / REF_AREA_UM2)  × area_weight     ← penalise area
       + (max_stage_delay_ps   / REF_CLOCK_PS)  × delay_weight    ← penalise tight stages
-      + balance_cv_norm                        × balance_weight  ← penalise uneven load
+      + balance_penalty                        × balance_weight  ← penalise skew + clock overload
       + (scheduler_runtime_s  / REF_TIMEOUT_S) × runtime_weight  ← penalise slow algos
 ```
 
@@ -905,9 +905,9 @@ Defaults from `alphaevolve/ppa_metrics.py` (overridable via `configs/evolve_conf
 | `stage_weight`   | 0.0     | weight    | Pipeline depth penalty. Usually kept at 0 when stage count is fixed or when timing is the main signal. |
 | `flop_weight`    | 0.5     | weight    | Pipeline register bit penalty. |
 | `area_weight`    | 0.0     | weight    | Combinational area rarely changes with scheduling; often left off unless slow-mode area is being trusted heavily. |
-| `delay_weight`   | 2.0     | weight    | Max stage delay penalty ??primary differentiator between scheduler quality. |
+| `delay_weight`   | 2.0     | weight    | Max stage delay penalty — primary differentiator between scheduler quality. |
 | `balance_weight` | 1.5     | weight    | Clock-aware stage-shape penalty. Lower is better; it grows when stage delays are uneven and/or multiple stages exceed the target clock. |
-| `runtime_weight` | 0.5     | weight    | Scheduler wall-clock penalty. Timeout gives `runtime_s=3600` ??normalized penalty of `3600/REF_TIMEOUT_S`. |
+| `runtime_weight` | 0.5     | weight    | Scheduler wall-clock penalty. Timeout gives `runtime_s=3600` → normalized penalty of `3600/REF_TIMEOUT_S`. |
 | `ref_stages`     | 16      | reference | Set automatically from `pipeline_stages` in YAML if fixed. |
 | `ref_flop_bits`  | 10000   | reference | Max expected pipeline register bits. |
 | `ref_area_um2`   | 50000   | reference | Max expected combinational area (um²). |
@@ -918,7 +918,7 @@ Defaults from `alphaevolve/ppa_metrics.py` (overridable via `configs/evolve_conf
 
 This is the maximum combinational delay across all pipeline stages, extracted from the `nodes: N, delay: Xps` lines in `benchmark_main` output. It replaces the old `critical_path_ps` (total design critical path) in the delay term. `critical_path_ps` was constant regardless of scheduling decisions; `max_stage_delay_ps` directly reflects how well the scheduler balanced stages.
 
-**Key metric: `balance_cv_norm` — stage load distribution**
+**Key metric: `balance_penalty` — clock-aware stage-shape**
 
 The balance term uses per-stage utilization relative to the target clock:
 
@@ -981,20 +981,20 @@ results/<timestamp>/
 INPUTS                         EVOLUTION ENGINE                   OUTPUTS
 ──────                         ────────────────                   ───────
 
-designs/*.x           ────►┐
-designs/*_benchmark.txt ──►│   (optional baseline AI context)
+designs/*.x           ─────►┐
+designs/*_benchmark.txt ───►│   (optional baseline AI context)
                             │
 configs/                    │   For each iteration:
-  evolve_config.yaml ─────►│
-  ppa_constraints.yaml ───►│   1. sampler.py  → AI → new C++ body
+  evolve_config.yaml ──────►│
+  ppa_constraints.yaml ────►│   1. sampler.py  → AI → new C++ body
                             │        (reference sources + variants +
-knowledge/**/*.md  ───────►│         baseline context + compile_error on retry)
+knowledge/**/*.md  ────────►│         baseline context + compile_error on retry)
                             │                    │
-xls/ (source)    ────────►│                    ▼
+xls/ (source)    ──────────►│                    ▼
   xls/scheduling/           │   2. evaluator.py  → splice → Bazel
-    agent_generated_         │           rebuild agent + codegen +
-    scheduler.cc ───────────►│           opt + ir_converter
-    (the ONLY file mutated)  │           (+ benchmark_main if slow)
+    agent_generated_        │            rebuild agent + codegen +
+    scheduler.cc ──────────►│            opt + ir_converter
+    (the ONLY file mutated) │            (+ benchmark_main if slow)
                             │                    │
                             │                    ▼
                             │   3. pipeline.py  DSLX → IR → opt →
@@ -1013,7 +1013,7 @@ xls/ (source)    ────────►│                    ▼
                             └────────────────────┘
                                     │
                                     ▼
-                         results/<timestamp>/
+                           results/<timestamp>/
                            best_algorithm.patch   ◄── apply to XLS
                            ppa_report.json              for permanent adoption
                            evolution_log.csv
