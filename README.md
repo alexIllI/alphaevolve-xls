@@ -13,7 +13,13 @@ In Google XLS, the scheduler sits between optimized IR and hardware generation. 
 
 The project evolves exactly one C++ function: `AgentGeneratedScheduler()` in `xls/scheduling/agent_generated_scheduler.cc`. This file is a standalone scheduler that XLS dispatches when it is invoked with `--scheduling_strategy=agent`. Every other XLS built-in scheduler (SDC, min-cut, ASAP, random) is left untouched — we do not mutate them.
 
-Each iteration, the AI (Codex CLI or the OpenAI API) reads the current scheduler source, a bundle of reference XLS sources (SDC, min-cut, dispatch code) and provided knowledge, and emits a new C++ body that must respect the scheduler contract. The candidate is incrementally recompiled with Bazel, run against a set of DSLX benchmark designs, and scored on PPA (pipeline stages, register bits, area, max stage delay, and stage-load balance). The best candidates become parents for the next generation. Details of the architecture are in [Overall Architecture](docs/architecture.md).
+Each iteration, the AI (Codex CLI or the OpenAI API) reads the current scheduler source, a bundle of reference XLS sources (SDC, min-cut, dispatch code) and provided knowledge, and emits a new C++ body that must respect the scheduler contract. The candidate is incrementally recompiled with Bazel, run against a set of DSLX benchmark designs, and scored on PPA (pipeline stages, register bits, area, max stage delay, and stage-load balance). The best candidates become parents for the next generation.
+
+Internal architecture documentation lives in `docs/`:
+- [Architecture.md](docs/Architecture.md) — what gets evolved, file map, scheduler contract
+- [Evolution_Loop.md](docs/Evolution_Loop.md) — per-iteration steps, AI prompting, retry logic
+- [Scoring_PPA.md](docs/Scoring_PPA.md) — XLS pipeline commands, ppa_mode matrix, scoring formula
+- [Output_Decisions.md](docs/Output_Decisions.md) — output layout, design decisions
 
 ### Scheduler contract
 
@@ -59,8 +65,9 @@ alphaevolve-xls/
 │   ├── dot_product/dot.x           8-element dot product
 │   ├── gemm4x4_int/gemm4x4_int.x  4×4 integer matrix multiply
 │   ├── idct/idct.x                 2D Inverse Discrete Cosine Transform
+│   ├── irregular_fusion/           Irregular datapath fusion benchmark
 │   ├── sha256/sha256.x             SHA-256 hash (complex control + data)
-│   ├── bitonic_sort/bitonic_sort.x Bitonic sort network
+│   ├── bitonic_sort/               bitonic_sort.x (library) + bitonic_sort_wrapper.x (concrete N=32 wrapper)
 │   ├── crc32/crc32.x               CRC-32 checksum
 │   └── matmul4x4/matmul_4x4.x     4×4 float32 FMA (proc design)
 ├── alphaevolve/
@@ -267,7 +274,7 @@ Evolution control:
   --iterations N            Number of evolution iterations (default: 10).
   --mutation_target NAME    Only 'agent_scheduler' is supported (default).
                             Kept as a flag for forward compatibility.
-  --num_islands N           Island populations (default: from evolve_config.yaml = 4).
+  --num_islands N           Island populations (default: from evolve_config.yaml = 1).
                             Use --num_islands 1 for single linear evolution (simplest).
   --island_id N             Pin ALL iterations to island N (0-indexed). Useful for
                             debugging one mutation variant in isolation.
@@ -332,13 +339,15 @@ Score weights and normalization references live in `configs/evolve_config.yaml`.
 The score formula is:
 
 ```
-score = (num_stages           / ref_stages)    × stage_weight    (default 1.0)   ← penalise depth
-      + (effective_flop_bits  / ref_flop_bits) × flop_weight     (default 0.5)   ← penalise reg bits
-      + (total_area_um²       / ref_area_um²)  × area_weight     (default 0.2)   ← penalise area
-      + (max_stage_delay_ps   / ref_clock_ps)  × delay_weight    (default 2.0)   ← penalise tight stages
+score = (num_stages           / ref_stages)    × stage_weight    (default 0.0)   ← penalise depth
+      + (effective_flop_bits  / ref_flop_bits) × power_weight    (default 0.5)   ← penalise reg bits
+      + (total_area_um²       / ref_area_um²)  × area_weight     (default 0.0)   ← penalise area
+      + (max_stage_delay_ps   / ref_clock_ps)  × delay_weight    (default 1.0)   ← penalise tight stages
       + balance_cv_norm                        × balance_weight  (default 1.5)   ← penalise uneven load
       + (scheduler_runtime_s  / ref_timeout_s) × runtime_weight  (default 0.5)   ← penalise slow algos
 ```
+
+> Defaults shown match `evolve_config.yaml`. `stage_weight` and `area_weight` are 0 by default because stage count is often fixed by `ppa_constraints.yaml` (making it a constant offset) and area changes little with scheduling. Raise them when running in `--ppa_mode slow` with meaningful area data. All weights are overridable in `configs/evolve_config.yaml`.
 
 Reference values are set automatically from CLI arguments:
 
