@@ -1,6 +1,7 @@
 # Results and generated artifacts
 results/
 plan/
+tmp/
 !results/.gitkeep
 *.bak
 *.head
